@@ -406,6 +406,7 @@ def train(
         ent_coef=0.01,
         vf_coef=0.5,
         max_grad_norm=0.5,
+        device="cpu",
         policy_kwargs={"net_arch": dict(pi=[256, 256], vf=[256, 256])},
     )
 
@@ -419,7 +420,7 @@ def train(
     )
     reward_callback = RewardLoggingCallback()
 
-    model.learn(total_timesteps=total_timesteps, callback=[eval_callback, reward_callback])
+    model.learn(total_timesteps=total_timesteps, callback=[eval_callback, reward_callback], progress_bar=True)
     model.save(f"{save_path}/final_model")
     print(f"Model saved to {save_path}/final_model")
     print(f"TensorBoard logs at {log_dir} — run: tensorboard --logdir {log_dir}")
@@ -456,6 +457,7 @@ def continue_training(
         total_timesteps=total_timesteps,
         callback=[eval_callback, reward_callback],
         reset_num_timesteps=False,
+        progress_bar=True,
     )
     model.save(f"{save_path}/final_model_hard")
     print(f"Model saved to {save_path}/final_model_hard")
