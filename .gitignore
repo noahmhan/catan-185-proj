@@ -137,4 +137,5 @@ dmypy.json
 # Pyre type checker
 .pyre/
 
-/db-data
+/db-datappo_catan_logs/
+ppo_catan_model/
