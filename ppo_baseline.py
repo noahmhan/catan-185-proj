@@ -14,6 +14,7 @@ Requirements:
  
  
 import numpy as np
+import torch
 import gymnasium
 from gymnasium import Wrapper
 from sb3_contrib.common.maskable.policies import MaskableActorCriticPolicy
@@ -21,11 +22,20 @@ from sb3_contrib.common.wrappers import ActionMasker
 from sb3_contrib.ppo_mask import MaskablePPO
 from sb3_contrib.common.maskable.callbacks import MaskableEvalCallback
 from stable_baselines3.common.callbacks import BaseCallback
+
+# sb3-contrib bug workaround: MaskableCategorical.apply_masking() calls
+# super().__init__() which re-validates the stale cached probs from the
+# previous (unmasked) initialization. With 328 actions and a trained policy
+# producing diverse logits, float32 softmax accumulates ~2e-6 rounding error —
+# exceeding PyTorch 2.x's Simplex tolerance of 1e-6 — causing a spurious
+# ValueError. Disabling validate_args removes these sanity checks without
+# affecting training correctness.
+torch.distributions.Distribution._validate_args = False
  
 import catanatron.gym
 from catanatron import Color
 from catanatron.models.enums import ActionType
-from catanatron.players.weighted_random import WeightedRandomPlayer
+from catanatron.players.minimax import AlphaBetaPlayer
 from catanatron.state_functions import (
     player_key,
     player_num_resource_cards,
@@ -452,7 +462,7 @@ def make_env():
             "map_type": "BASE",
             "vps_to_win": 15,          # 15 VP to win (1v1 variant)
             "enemies": [
-                WeightedRandomPlayer(Color.RED),
+                AlphaBetaPlayer(Color.RED, 2, True),
             ],
         },
     )
