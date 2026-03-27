@@ -20,6 +20,7 @@ dependencies = ["networkx", "click", "rich"]
 
 [project.optional-dependencies]
 gym = ["gymnasium<=0.29.1", "numpy", "pandas", "fastparquet", "pygame"]
+rl = ["stable-baselines3>=2.0.0", "sb3-contrib>=2.0.0", "torch", "tensorboard", "tqdm", "rich"]
 web = [
     "gunicorn",
     "flask",

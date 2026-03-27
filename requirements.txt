@@ -1,1 +1,1 @@
--e .[gym,web]
+-e .[gym,web,rl]

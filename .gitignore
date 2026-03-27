@@ -1,3 +1,7 @@
+# PPO training outputs
+ppo_catan_logs/
+ppo_catan_model*/
+
 # Added by Bryan
 .vscode
 logs/
