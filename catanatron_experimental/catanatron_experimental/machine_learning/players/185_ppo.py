@@ -81,76 +81,79 @@ def resource_flow_score(state, color):
 def network_position_score(state, color):
     """
     Network Position Channel (score function, reward = delta between turns):
-    - +0.1 * pips per settlement tile (doubled for cities), zeroed if robber present
-    - +0.6 per unique resource type accessible
-    - +0.8 for generic port access
-    - +0.4 per specific port access
-    - +0.1 per road + +0.1 per road in longest connected path
-    - +0.04 * pip_sum per open buildable node reachable via road network
+    - +0.1 per production pip covered by settlements (doubled for cities)
+      (zeroed if robber is on that tile)
+    - +0.6 per unique resource type accessible from settlements/cities
+    - +0.8 for having >= 1 generic port
+    - +0.4 per specific resource port connected
+    - +0.1 per total road + 0.1 per road in longest connected path
+    - +0.04 * (total pips of adjacent tiles) per open settlement spot
+      reachable via road network
     """
+    board = state.board
+    score = 0.0
+
+    # Pip counts for dice values (2-12, index by number)
     pip_counts = {2: 1, 3: 2, 4: 3, 5: 4, 6: 5, 7: 0, 8: 5, 9: 4, 10: 3, 11: 2, 12: 1}
 
-    board = state.board
-    buildings = board.buildings
+    # LandTile has no coordinate attribute; build id->coordinate lookup from map
+    tile_coord = {tile.id: coord for coord, tile in board.map.land_tiles.items()}
     robber_coordinate = board.robber_coordinate
-    score = 0.0
+
     resource_types_accessible = set()
 
+    # board.buildings is Dict[NodeId, Tuple[Color, FastBuildingType]]
+    buildings = board.buildings
     for node_id, (bldg_color, bldg_type) in buildings.items():
         if bldg_color != color:
             continue
 
         multiplier = 2 if bldg_type == "CITY" else 1
 
-        try:
-            tiles = board.map.adjacent_tiles.get(node_id, [])
-        except AttributeError:
-            tiles = []
+        # board.map.adjacent_tiles is Dict[NodeId, List[LandTile]]
+        for tile in board.map.adjacent_tiles.get(node_id, []):
+            if tile.resource is None:  # desert
+                continue
 
-        for tile in tiles:
-            if tile.resource is None:
-                continue
             resource_types_accessible.add(tile.resource)
-            if tile.coordinate == robber_coordinate:
+
+            # Zero pips if robber is on this tile
+            if tile_coord.get(tile.id) == robber_coordinate:
                 continue
+
             pips = pip_counts.get(tile.number, 0) if tile.number else 0
             score += pips * 0.1 * multiplier
 
+    # Resource diversity
     score += len(resource_types_accessible) * 0.6
 
+    # Port access — board.map.port_nodes is Dict[FastResource|None, Set[NodeId]]
     has_generic_port = False
-    try:
-        for resource, node_ids in board.map.port_nodes.items():
-            if any(nid in buildings and buildings[nid][0] == color for nid in node_ids):
-                if resource is None:
-                    has_generic_port = True
-                else:
-                    score += 0.4
-    except (AttributeError, TypeError):
-        pass
+    for resource, node_ids in board.map.port_nodes.items():
+        if any(nid in buildings and buildings[nid][0] == color for nid in node_ids):
+            if resource is None:  # generic 3:1 port
+                has_generic_port = True
+            else:
+                score += 0.4
 
     if has_generic_port:
         score += 0.8
 
+    # Road network
     roads = [(edge, c) for edge, c in board.roads.items() if c == color]
-    num_roads = len(roads) // 2
+    num_roads = len(roads) // 2  # roads stored bidirectionally
     longest_road = get_longest_road_length(state, color)
     score += num_roads * 0.1 + longest_road * 0.1
 
-    try:
-        buildable = board.buildable_node_ids(color)
-        for node_id in buildable:
-            pip_sum = 0
-            try:
-                tiles = board.map.adjacent_tiles.get(node_id, [])
-                for tile in tiles:
-                    if tile.number:
-                        pip_sum += pip_counts.get(tile.number, 0)
-            except (AttributeError, TypeError):
-                pip_sum = 3
-            score += 0.04 * pip_sum
-    except (AttributeError, TypeError):
-        pass
+    # Open settlement spots weighted by pip quality
+    subgraphs = board.find_connected_components(color)
+    buildable = board.buildable_node_ids(color) if subgraphs else []
+    for node_id in buildable:
+        pip_sum = 0
+        for tile in board.map.adjacent_tiles.get(node_id, []):
+            if tile.number:
+                pip_sum += pip_counts.get(tile.number, 0)
+        score += 0.04 * pip_sum
 
     return score
 
@@ -238,7 +241,7 @@ class CatanRewardWrapper(Wrapper):
         obs, info = self.env.reset(**kwargs)
         state = self.env.unwrapped.game.state
         self._prev_resource_score = resource_flow_score(state, self.p0_color)
-        self._prev_position_score = self._safe_position_score(state)
+        self._prev_position_score = network_position_score(state, self.p0_color)
         self._prev_vps = get_victory_points(state, self.p0_color)
         self._prev_knights = get_knights_played(state, self.p0_color)
         self._ep_r_resource = 0.0
@@ -267,7 +270,7 @@ class CatanRewardWrapper(Wrapper):
 
         # Network position: delta-based; scaled by 0.3 so build events (+3–8 raw)
         # land at ~+1–2, comparable to a VP gain.
-        current_position = self._safe_position_score(state)
+        current_position = network_position_score(state, self.p0_color)
         r_position = 0.3 * (current_position - self._prev_position_score)
         self._prev_position_score = current_position
 
@@ -382,7 +385,7 @@ def train(
     log_dir="./ppo_catan_logs",
     eval_freq=10_000,
     n_eval_episodes=20,
-    n_envs=4,
+    n_envs=2,
     env_fn=make_env,
 ):
     env = SubprocVecEnv([env_fn] * n_envs)
@@ -395,7 +398,7 @@ def train(
         tensorboard_log=log_dir,
         learning_rate=3e-4,
         n_steps=2048,
-        batch_size=256,
+        batch_size=128,
         n_epochs=10,
         gamma=0.999,
         gae_lambda=0.95,
@@ -432,7 +435,7 @@ def continue_training(
     total_timesteps=500_000,
     eval_freq=10_000,
     n_eval_episodes=20,
-    n_envs=4,
+    n_envs=2,
 ):
     env = SubprocVecEnv([make_env_hard] * n_envs)
     eval_env = make_env_hard()
