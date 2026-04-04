@@ -1,10 +1,12 @@
 import os
+import random
+import multiprocessing as mp
 
 import numpy as np
 import gymnasium
 from gymnasium import Wrapper
 from stable_baselines3.common.callbacks import BaseCallback
-from stable_baselines3.common.vec_env import SubprocVecEnv
+from stable_baselines3.common.vec_env import SubprocVecEnv, VecNormalize, DummyVecEnv
 from sb3_contrib.common.maskable.callbacks import MaskableEvalCallback
 from sb3_contrib.common.maskable.policies import MaskableActorCriticPolicy
 from sb3_contrib.common.wrappers import ActionMasker
@@ -13,6 +15,7 @@ from sb3_contrib.ppo_mask import MaskablePPO
 from catanatron import Color, Player
 from catanatron.players.weighted_random import WeightedRandomPlayer
 from catanatron.players.minimax import AlphaBetaPlayer
+from catanatron.players.value import ValueFunctionPlayer
 from catanatron.state_functions import player_key, player_num_resource_cards
 import catanatron.gym
 
@@ -301,14 +304,43 @@ class CatanRewardWrapper(Wrapper):
 
 
 # ================================================================
+# EPSILON-GREEDY OPPONENT WRAPPER
+# ================================================================
+
+class EpsilonGreedyPlayer(Player):
+    """
+    Wraps any Player: with probability epsilon picks a uniformly random
+    action, otherwise delegates to the wrapped player's decide().
+    Makes a strong deterministic opponent beatable so the agent can
+    receive positive terminal rewards and learn from wins.
+    """
+
+    def __init__(self, player, epsilon):
+        super().__init__(player.color, is_bot=True)
+        self._player = player
+        self.epsilon = epsilon
+
+    def decide(self, game, playable_actions):
+        if random.random() < self.epsilon:
+            return random.choice(playable_actions)
+        return self._player.decide(game, playable_actions)
+
+    def reset_state(self):
+        self._player.reset_state()
+
+
+# ================================================================
 # ACTION MASK FUNCTION
 # ================================================================
 
 def mask_fn(env) -> np.ndarray:
     valid_actions = env.unwrapped.get_valid_actions()
-    mask = np.zeros(env.action_space.n, dtype=np.float32)
-    mask[valid_actions] = 1
-    return np.array([bool(i) for i in mask])
+    mask = np.zeros(env.action_space.n, dtype=bool)
+    if valid_actions:
+        mask[valid_actions] = True
+    else:
+        mask[0] = True  # safety: never return all-False (causes NaN softmax)
+    return mask
 
 
 # ================================================================
@@ -370,7 +402,7 @@ def make_env_hard():
     env = gymnasium.make(
         "catanatron/Catanatron-v0",
         config={
-            "enemies": [AlphaBetaPlayer(Color.RED)],
+            "enemies": [AlphaBetaPlayer(Color.RED, depth=1)],
             "vps_to_win": 15,
         },
     )
@@ -379,13 +411,114 @@ def make_env_hard():
     return env
 
 
+def make_env_medium(epsilon=0.4):
+    env = gymnasium.make(
+        "catanatron/Catanatron-v0",
+        config={
+            "enemies": [EpsilonGreedyPlayer(ValueFunctionPlayer(Color.RED), epsilon=epsilon)],
+            "vps_to_win": 15,
+        },
+    )
+    env = CatanRewardWrapper(env)
+    env = ActionMasker(env, mask_fn)
+    return env
+
+
+class _MediumEnvFn:
+    """Picklable env factory for SubprocVecEnv (lambdas are not reliably picklable on Windows)."""
+
+    def __init__(self, epsilon):
+        self.epsilon = epsilon
+
+    def __call__(self):
+        return make_env_medium(self.epsilon)
+
+
+def train_vs_medium(
+    epsilon=0.4,
+    total_timesteps=5_000_000,
+    save_path=MODEL_PATH,
+    log_dir="./ppo_catan_logs",
+    eval_freq=20_000,
+    n_eval_episodes=20,
+    n_envs=4,
+    load_path=None,
+):
+    """
+    Train (or fine-tune from load_path) against an epsilon-greedy
+    ValueFunctionPlayer. epsilon=0.4 means 40% random moves, making
+    the opponent beatable so the agent receives positive terminal rewards
+    and can learn from wins. Tune epsilon down as the agent improves.
+    """
+    vec_normalize_path = os.path.join(save_path, "vecnormalize_medium.pkl")
+
+    raw_env = SubprocVecEnv([_MediumEnvFn(epsilon) for _ in range(n_envs)])
+    if load_path and os.path.exists(vec_normalize_path):
+        env = VecNormalize.load(vec_normalize_path, raw_env)
+        env.training = True
+        env.norm_reward = True
+    else:
+        env = VecNormalize(raw_env, norm_obs=False, norm_reward=True, clip_reward=10.0)
+
+    eval_env = VecNormalize(
+        DummyVecEnv([_MediumEnvFn(epsilon)]),
+        norm_obs=False, norm_reward=False, training=False,
+    )
+
+    if load_path:
+        model = MaskablePPO.load(load_path, env=env)
+    else:
+        model = MaskablePPO(
+            MaskableActorCriticPolicy,
+            env,
+            verbose=1,
+            tensorboard_log=log_dir,
+            learning_rate=3e-4,
+            n_steps=8192,
+            batch_size=512,
+            n_epochs=10,
+            gamma=0.999,
+            gae_lambda=0.95,
+            clip_range=0.2,
+            ent_coef=0.08,
+            vf_coef=0.5,
+            max_grad_norm=0.5,
+            device="cpu",
+            policy_kwargs={"net_arch": dict(pi=[256, 256, 256], vf=[256, 256, 256])},
+        )
+
+    eval_callback = MaskableEvalCallback(
+        eval_env,
+        best_model_save_path=f"{save_path}/best_medium",
+        log_path=log_dir,
+        eval_freq=eval_freq,
+        n_eval_episodes=n_eval_episodes,
+        deterministic=True,
+    )
+
+    model.learn(
+        total_timesteps=total_timesteps,
+        callback=[eval_callback, RewardLoggingCallback()],
+        reset_num_timesteps=(load_path is None),
+        progress_bar=True,
+    )
+    model.save(f"{save_path}/medium_model")
+    env.save(vec_normalize_path)
+    print(f"Model saved to {save_path}/medium_model")
+    print(f"VecNormalize stats saved to {vec_normalize_path}")
+    print(f"TensorBoard logs at {log_dir} — run: tensorboard --logdir {log_dir}")
+    env.close()
+    eval_env.close()
+    return model
+
+
 def train(
     total_timesteps=1_000_000,
     save_path=MODEL_PATH,
     log_dir="./ppo_catan_logs",
     eval_freq=10_000,
     n_eval_episodes=20,
-    n_envs=2,
+    n_envs=4,
     env_fn=make_env,
 ):
     env = SubprocVecEnv([env_fn] * n_envs)
@@ -397,17 +530,17 @@ def train(
         verbose=1,
         tensorboard_log=log_dir,
         learning_rate=3e-4,
-        n_steps=2048,
-        batch_size=128,
+        n_steps=4096,
+        batch_size=512,
         n_epochs=10,
         gamma=0.999,
         gae_lambda=0.95,
         clip_range=0.2,
-        ent_coef=0.01,
+        ent_coef=0.03,
         vf_coef=0.5,
         max_grad_norm=0.5,
         device="cpu",
-        policy_kwargs={"net_arch": dict(pi=[256, 256], vf=[256, 256])},
+        policy_kwargs={"net_arch": dict(pi=[256, 256, 256], vf=[256, 256, 256])},
     )
 
     eval_callback = MaskableEvalCallback(
@@ -436,7 +569,7 @@ def continue_training(
     total_timesteps=500_000,
     eval_freq=10_000,
     n_eval_episodes=20,
-    n_envs=2,
+    n_envs=4,
 ):
     env = SubprocVecEnv([make_env_hard] * n_envs)
     eval_env = make_env_hard()
@@ -464,6 +597,227 @@ def continue_training(
     env.close()
     eval_env.close()
     return model
+
+
+# ================================================================
+# LEAGUE / OPPONENT-SAMPLING TRAINING
+# ================================================================
+
+# Opponent tiers ordered Easy → Hard based on the catanatron leaderboard:
+#   WeightedRandom < MCTS(n=100) < GreedyPlayouts(n=25) < AlphaBeta
+# We use MCTSPlayer(n=25) as Medium — fast enough to use as a live training
+# opponent (GreedyPlayoutsPlayer runs ~185 s per initial-placement decision).
+# ValueFunctionPlayer is a fast greedy one-step lookahead that sits between
+# WeightedRandom and AlphaBeta on the leaderboard.
+OPPONENT_TIERS = [
+    ("easy",   lambda: WeightedRandomPlayer(Color.RED)),
+    ("medium", lambda: EpsilonGreedyPlayer(ValueFunctionPlayer(Color.RED), epsilon=0.4)),
+    ("hard",   lambda: AlphaBetaPlayer(Color.RED, depth=1)),
+]
+
+# Sampling weights [easy, medium, hard] per stage
+STAGE_WEIGHTS = [
+    [0.80, 0.20, 0.00],   # Stage 0: build basics vs WeightedRandom
+    [0.30, 0.50, 0.20],   # Stage 1: focus on MCTS, keep basics
+    [0.10, 0.30, 0.60],   # Stage 2: sharpen vs AlphaBeta
+]
+
+# Win-rate threshold (over a rolling window) to advance from each stage.
+# Index matches the stage number; we check win rate against the *primary*
+# tier for that stage (tier 0 for stage 0, tier 1 for stage 1).
+STAGE_UP_THRESHOLDS = [0.80, 0.20]
+MIN_TIER_EPISODES = 50   # minimum same-tier episodes before checking
+
+
+class LeagueWrapper(Wrapper):
+    """
+    Swaps the opponent inside CatanatronEnv at each episode reset based on
+    the current league stage stored in a shared multiprocessing Value.
+    Injects ``tier_idx`` into the info dict at episode end so
+    LeagueAdaptCallback can track per-tier win rates.
+
+    Expected wrapper stack (inner → outer):
+        CatanatronEnv → CatanRewardWrapper → LeagueWrapper → ActionMasker
+    """
+
+    def __init__(self, env, stage_val):
+        super().__init__(env)
+        self._stage_val = stage_val
+        self._tier_idx = 0
+
+    def reset(self, **kwargs):
+        stage = min(self._stage_val.value, len(STAGE_WEIGHTS) - 1)
+        weights = STAGE_WEIGHTS[stage]
+        self._tier_idx = int(np.random.choice(len(weights), p=weights))
+        new_opp = OPPONENT_TIERS[self._tier_idx][1]()   # call factory
+
+        # CatanatronEnv.reset() re-creates the Game from self.players, so
+        # updating both list slots is enough — no env recreation needed.
+        from catanatron.gym.envs.catanatron_env import CatanatronEnv as _CatanatronEnv
+        unwrapped: _CatanatronEnv = self.env.unwrapped  # type: ignore[assignment]
+        unwrapped.enemies[0] = new_opp
+        unwrapped.players[1] = new_opp
+
+        return self.env.reset(**kwargs)
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        if terminated or truncated:
+            info["tier_idx"] = self._tier_idx
+        return obs, reward, terminated, truncated, info
+
+
+class LeagueAdaptCallback(BaseCallback):
+    """
+    Reads tier_idx / win from episode-end info injected by LeagueWrapper /
+    CatanRewardWrapper and advances the shared stage when thresholds are met:
+
+      Stage 0 → 1 : easy   win rate ≥ STAGE_UP_THRESHOLDS[0] over last 100 ep
+      Stage 1 → 2 : medium win rate ≥ STAGE_UP_THRESHOLDS[1] over last 100 ep
+
+    Logs ``league/stage`` and ``league/win_rate_{tier}`` to TensorBoard.
+    """
+
+    def __init__(self, stage_val, window=100, verbose=0):
+        super().__init__(verbose)
+        self._stage_val = stage_val
+        self._window = window
+        self._tier_wins = [[] for _ in range(len(OPPONENT_TIERS))]
+
+    def _on_step(self) -> bool:
+        for info in self.locals["infos"]:
+            if "tier_idx" not in info or "win" not in info:
+                continue
+            self._tier_wins[info["tier_idx"]].append(info["win"])
+
+        stage = self._stage_val.value
+        if stage < len(STAGE_UP_THRESHOLDS):
+            wins = self._tier_wins[stage]   # check tier matching current stage
+            if len(wins) >= MIN_TIER_EPISODES:
+                rate = float(np.mean(wins[-self._window:]))
+                threshold = STAGE_UP_THRESHOLDS[stage]
+                if rate >= threshold:
+                    self._stage_val.value = stage + 1
+                    tier_name = OPPONENT_TIERS[stage][0]
+                    print(
+                        f"\n[League] Stage {stage} → {stage + 1}  "
+                        f"({tier_name} win rate: {rate:.1%} ≥ {threshold:.0%})"
+                    )
+
+        self.logger.record("league/stage", float(self._stage_val.value))
+        for i, (name, _) in enumerate(OPPONENT_TIERS):
+            if len(self._tier_wins[i]) >= 10:
+                self.logger.record(
+                    f"league/win_rate_{name}",
+                    float(np.mean(self._tier_wins[i][-self._window:])),
+                )
+        return True
+
+
+class _LeagueEnvFn:
+    """
+    Picklable env factory that captures a Manager-proxy stage value so
+    SubprocVecEnv worker processes (spawned on Windows) can share it.
+    """
+
+    def __init__(self, stage_val):
+        self._stage_val = stage_val
+
+    def __call__(self):
+        return make_league_env(self._stage_val)
+
+
+def make_league_env(stage_val):
+    env = gymnasium.make(
+        "catanatron/Catanatron-v0",
+        config={"enemies": [WeightedRandomPlayer(Color.RED)], "vps_to_win": 15},
+    )
+    env = CatanRewardWrapper(env)
+    env = LeagueWrapper(env, stage_val)
+    env = ActionMasker(env, mask_fn)
+    return env
+
+
+def league_train(
+    total_timesteps=2_000_000,
+    save_path=MODEL_PATH,
+    log_dir="./ppo_catan_logs",
+    eval_freq=20_000,
+    n_eval_episodes=20,
+    n_envs=4,
+    load_path=None,
+):
+    """
+    Train (or fine-tune) with opponent sampling / league training.
+
+    Starts all envs against WeightedRandom and automatically shifts the
+    opponent distribution toward harder bots as win-rate thresholds are met.
+    The eval callback uses a fixed WeightedRandom opponent so the mean-reward
+    curve stays comparable across stages.
+
+    Args:
+        load_path: if provided, load an existing checkpoint and continue
+                   (reset_num_timesteps=False so TensorBoard x-axis is
+                   continuous and schedules, if any, behave correctly).
+    """
+    # Manager creates a server process that owns the value; the returned
+    # proxy is picklable so SubprocVecEnv workers can share it via spawn.
+    with mp.Manager() as manager:
+        stage_val = manager.Value("i", 0)
+        env_fns: list = [_LeagueEnvFn(stage_val) for _ in range(n_envs)]
+        vec_normalize_path = os.path.join(save_path, "vecnormalize.pkl")
+        if load_path and os.path.exists(vec_normalize_path):
+            env = VecNormalize.load(vec_normalize_path, SubprocVecEnv(env_fns))
+            env.training = True
+            env.norm_reward = True
+        else:
+            env = VecNormalize(SubprocVecEnv(env_fns), norm_obs=False, norm_reward=True, clip_reward=10.0)
+        eval_env = VecNormalize(DummyVecEnv([make_env]), norm_obs=False, norm_reward=False, training=False)
+
+        if load_path:
+            model = MaskablePPO.load(load_path, env=env)
+        else:
+            model = MaskablePPO(
+                MaskableActorCriticPolicy,
+                env,
+                verbose=1,
+                tensorboard_log=log_dir,
+                learning_rate=3e-4,
+                n_steps=8192,
+                batch_size=512,
+                n_epochs=10,
+                gamma=0.999,
+                gae_lambda=0.95,
+                clip_range=0.2,
+                ent_coef=0.08,
+                vf_coef=0.5,
+                max_grad_norm=0.5,
+                device="cpu",
+                policy_kwargs={"net_arch": dict(pi=[256, 256, 256], vf=[256, 256, 256])},
+            )
+
+        eval_callback = MaskableEvalCallback(
+            eval_env,
+            best_model_save_path=f"{save_path}/best_league",
+            log_path=log_dir,
+            eval_freq=eval_freq,
+            n_eval_episodes=n_eval_episodes,
+            deterministic=True,
+        )
+
+        model.learn(
+            total_timesteps=total_timesteps,
+            callback=[eval_callback, RewardLoggingCallback(), LeagueAdaptCallback(stage_val)],
+            reset_num_timesteps=(load_path is None),
+            progress_bar=True,
+        )
+        model.save(f"{save_path}/league_model")
+        env.save(vec_normalize_path)
+        print(f"Model saved to {save_path}/league_model")
+        print(f"VecNormalize stats saved to {vec_normalize_path}")
+        print(f"TensorBoard logs at {log_dir} — run: tensorboard --logdir {log_dir}")
+        env.close()
+        eval_env.close()
 
 
 # ================================================================
@@ -511,6 +865,40 @@ if __name__ == "__main__":
         help="Train from scratch against AlphaBetaPlayer instead of WeightedRandomPlayer",
     )
     parser.add_argument(
+        "--medium",
+        action="store_true",
+        help="Train from scratch against epsilon-greedy ValueFunctionPlayer",
+    )
+    parser.add_argument(
+        "--medium-continue",
+        metavar="MODEL_PATH",
+        default=None,
+        help="Fine-tune an existing checkpoint against epsilon-greedy ValueFunctionPlayer",
+    )
+    parser.add_argument(
+        "--epsilon",
+        type=float,
+        default=0.4,
+        help="Epsilon for the epsilon-greedy medium opponent (default: 0.4)",
+    )
+    parser.add_argument(
+        "--league",
+        action="store_true",
+        help="Train from scratch with opponent sampling / league training",
+    )
+    parser.add_argument(
+        "--league-continue",
+        metavar="MODEL_PATH",
+        default=None,
+        help="Fine-tune an existing checkpoint with league training (e.g. ppo_catan_model/league_model)",
+    )
+    parser.add_argument(
+        "--timesteps",
+        type=int,
+        default=None,
+        help="Override total_timesteps for any training mode",
+    )
+    parser.add_argument(
         "--save-path",
         default=MODEL_DIR,
         help=f"Directory to save the model (default: {MODEL_DIR})",
@@ -522,23 +910,51 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    if args.continue_training:
+    if args.medium_continue:
+        train_vs_medium(
+            epsilon=args.epsilon,
+            load_path=args.medium_continue,
+            save_path=args.save_path,
+            log_dir=args.log_dir,
+            total_timesteps=args.timesteps or 5_000_000,
+        )
+    elif args.medium:
+        train_vs_medium(
+            epsilon=args.epsilon,
+            save_path=args.save_path,
+            log_dir=args.log_dir,
+            total_timesteps=args.timesteps or 5_000_000,
+        )
+    elif args.league_continue:
+        league_train(
+            load_path=args.league_continue,
+            save_path=args.save_path,
+            log_dir=args.log_dir,
+            total_timesteps=args.timesteps or 2_000_000,
+        )
+    elif args.league:
+        league_train(
+            save_path=args.save_path,
+            log_dir=args.log_dir,
+            total_timesteps=args.timesteps or 2_000_000,
+        )
+    elif args.continue_training:
         continue_training(
             load_path=args.continue_training,
             save_path=args.save_path,
             log_dir=args.log_dir,
-            total_timesteps=500_000,
+            total_timesteps=args.timesteps or 500_000,
         )
     elif args.hard:
         train(
-            total_timesteps=500_000,
+            total_timesteps=args.timesteps or 500_000,
             save_path=args.save_path,
             log_dir=args.log_dir,
             env_fn=make_env_hard,
         )
     else:
         train(
-            total_timesteps=500_000,
+            total_timesteps=args.timesteps or 500_000,
             save_path=args.save_path,
             log_dir=args.log_dir,
         )
