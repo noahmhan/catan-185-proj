@@ -19,6 +19,9 @@ from catanatron.players.value import ValueFunctionPlayer
 from catanatron.state_functions import player_key, player_num_resource_cards
 import catanatron.gym
 
+import torch
+torch.distributions.Distribution.set_default_validate_args(False)
+
 
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "ppo_catan_model")
 MODEL_PATH = os.path.join(MODEL_DIR, "final_model")
