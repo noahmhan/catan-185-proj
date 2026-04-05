@@ -27,7 +27,7 @@ sys.path.insert(0, os.path.join(ROOT, "catanatron_experimental"))
 from sb3_contrib.ppo_mask import MaskablePPO
 
 from catanatron import Color, Game, Player
-from catanatron.features import create_sample, get_feature_ordering
+from catanatron.features import get_feature_ordering
 from catanatron.gym.envs.action_space import (
     from_action_space,
     get_action_array,
@@ -37,10 +37,16 @@ from catanatron.players.minimax import AlphaBetaPlayer
 from catanatron.players.value import ValueFunctionPlayer
 from catanatron.web.models import GameState, database_session
 from catanatron.web.utils import ensure_link, open_link
+import importlib as _il
+_ppo_mod = _il.import_module("catanatron_experimental.machine_learning.players.185_ppo")
+compute_features = _ppo_mod.compute_features
 
 # ---------------------------------------------------------------------------
 # Paths to trained artefacts
 # ---------------------------------------------------------------------------
+
+BEST_MODEL = os.path.join(ROOT, "best_ppo", "league_model.zip")
+BEST_NORM = os.path.join(ROOT, "best_ppo", "vecnormalize.pkl")
 
 LEAGUE_MODEL  = os.path.join(ROOT, "ppo_league", "league_model.zip")
 BEST_LEAGUE   = os.path.join(ROOT, "ppo_league", "best_league", "best_model.zip")
@@ -55,6 +61,7 @@ MODEL_REGISTRY = {
     "best_league": (BEST_LEAGUE,  LEAGUE_NORM),
     "medium":      (MEDIUM_MODEL, MEDIUM_NORM),
     "best_medium": (BEST_MEDIUM,  MEDIUM_NORM),
+    "best":        (BEST_MODEL, BEST_NORM),
 }
 
 # ---------------------------------------------------------------------------
@@ -78,8 +85,8 @@ class PPOPlayer(Player):
         print(f"[PPOPlayer] Loaded model from {model_path}")
 
     def _get_obs(self, game: Game) -> np.ndarray:
-        sample = create_sample(game, self.color)
-        return np.array([sample[f] for f in FEATURES], dtype=np.float32)
+        opp_color = Color.RED if self.color == Color.BLUE else Color.BLUE
+        return compute_features(game.state, self.color, opp_color)
 
     def _get_action_mask(self, game: Game) -> np.ndarray:
         valid_ints = {
@@ -151,7 +158,7 @@ def play_game(ppo_player: PPOPlayer, opponent: Player, game_num: int) -> tuple:
     print(f"  BLUE: {ppo_player.name}")
     print(f"  RED:  {opp_label}")
 
-    game = Game(players, vps_to_win=15)
+    game = Game(players, vps_to_win=15, discard_limit=7)
 
     # Collect all states during play, then commit once — avoids opening a new
     # DB engine on every tick (the main performance killer).
@@ -178,8 +185,8 @@ def main():
     parser.add_argument(
         "--model",
         choices=list(MODEL_REGISTRY.keys()),
-        default="league",
-        help="Which trained model to load (default: league)",
+        default="best",
+        help="Which trained model to load (default: best)",
     )
     parser.add_argument(
         "--opponent",
