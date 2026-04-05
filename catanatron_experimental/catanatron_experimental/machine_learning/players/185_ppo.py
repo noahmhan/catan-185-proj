@@ -192,6 +192,66 @@ def vp_proximity_reward(state, color, prev_vps, prev_knights, opp_color):
     return float(vp_delta) + knight_reward
 
 
+FEATURE_DIM = 25
+
+
+def compute_features(state, color, opp_color):
+    """25-dim hand-crafted feature vector using the same information
+    the heuristic bots use to make decisions."""
+    hand = get_player_hand(state, color)
+    opp_hand = get_player_hand(state, opp_color)
+    hand_size = sum(hand.values())
+
+    my_vps = get_victory_points(state, color)
+    opp_vps = get_victory_points(state, opp_color)
+    my_knights = get_knights_played(state, color)
+    opp_knights = get_knights_played(state, opp_color)
+    my_road = get_longest_road_length(state, color)
+    opp_road = get_longest_road_length(state, opp_color)
+
+    pos_score = network_position_score(state, color)
+    opp_pos_score = network_position_score(state, opp_color)
+
+    return np.array([
+        # Resource state (8 features)
+        hand_size / 10.0,
+        sum(1 for v in hand.values() if v > 0) / 5.0,
+        hand.get("WOOD", 0) / 5.0,
+        hand.get("BRICK", 0) / 5.0,
+        hand.get("SHEEP", 0) / 5.0,
+        hand.get("WHEAT", 0) / 5.0,
+        hand.get("ORE", 0) / 5.0,
+        sum(opp_hand.values()) / 10.0,
+
+        # VP state (5 features)
+        my_vps / 15.0,
+        opp_vps / 15.0,
+        (my_vps - opp_vps) / 15.0,
+        my_vps / 15.0,                # progress toward win
+        max(0, 15 - my_vps) / 15.0,  # distance to win
+
+        # Army race (4 features)
+        my_knights / 5.0,
+        opp_knights / 5.0,
+        float(my_knights >= 3 and my_knights > opp_knights),
+        float(opp_knights >= 3 and opp_knights > my_knights),
+
+        # Road race (4 features)
+        my_road / 10.0,
+        opp_road / 10.0,
+        float(my_road >= 5 and my_road > opp_road),
+        float(opp_road >= 5 and opp_road > my_road),
+
+        # Board position (3 features)
+        pos_score / 10.0,
+        opp_pos_score / 10.0,
+        (pos_score - opp_pos_score) / 10.0,
+
+        # Resource flow score (1 feature)
+        resource_flow_score(state, color) / 2.0,
+    ], dtype=np.float32)
+
+
 def terminal_reward(game, color):
     """
     Terminal Reward (fired once on game end):
@@ -307,6 +367,31 @@ class CatanRewardWrapper(Wrapper):
 
 
 # ================================================================
+# FEATURE OBSERVATION WRAPPER
+# ================================================================
+
+class CatanFeatureWrapper(gymnasium.ObservationWrapper):
+    """
+    Replaces the flat Catanatron observation (300+ raw indices) with a
+    25-dim hand-crafted feature vector computed from the same scoring
+    functions used in rewards. The network no longer needs to rediscover
+    board structure from raw tile indices.
+    """
+
+    def __init__(self, env):
+        super().__init__(env)
+        self.p0_color = Color.BLUE
+        self.opp_color = Color.RED
+        self.observation_space = gymnasium.spaces.Box(
+            low=-np.inf, high=np.inf, shape=(FEATURE_DIM,), dtype=np.float32
+        )
+
+    def observation(self, obs):
+        state = self.env.unwrapped.game.state
+        return compute_features(state, self.p0_color, self.opp_color)
+
+
+# ================================================================
 # EPSILON-GREEDY OPPONENT WRAPPER
 # ================================================================
 
@@ -397,6 +482,7 @@ def make_env():
         },
     )
     env = CatanRewardWrapper(env)
+    env = CatanFeatureWrapper(env)
     env = ActionMasker(env, mask_fn)
     return env
 
@@ -410,6 +496,7 @@ def make_env_hard():
         },
     )
     env = CatanRewardWrapper(env)
+    env = CatanFeatureWrapper(env)
     env = ActionMasker(env, mask_fn)
     return env
 
@@ -423,6 +510,7 @@ def make_env_medium(epsilon=0.4):
         },
     )
     env = CatanRewardWrapper(env)
+    env = CatanFeatureWrapper(env)
     env = ActionMasker(env, mask_fn)
     return env
 
@@ -543,7 +631,7 @@ def train(
         vf_coef=0.5,
         max_grad_norm=0.5,
         device="cpu",
-        policy_kwargs={"net_arch": dict(pi=[256, 256, 256], vf=[256, 256, 256])},
+        policy_kwargs={"net_arch": dict(pi=[256, 256], vf=[256, 256])},
     )
 
     eval_callback = MaskableEvalCallback(
@@ -614,7 +702,7 @@ def continue_training(
 # WeightedRandom and AlphaBeta on the leaderboard.
 OPPONENT_TIERS = [
     ("easy",   lambda: WeightedRandomPlayer(Color.RED)),
-    ("medium", lambda: EpsilonGreedyPlayer(ValueFunctionPlayer(Color.RED), epsilon=0.4)),
+    ("medium", lambda: ValueFunctionPlayer(Color.RED)),
     ("hard",   lambda: AlphaBetaPlayer(Color.RED, depth=1)),
 ]
 
@@ -628,7 +716,7 @@ STAGE_WEIGHTS = [
 # Win-rate threshold (over a rolling window) to advance from each stage.
 # Index matches the stage number; we check win rate against the *primary*
 # tier for that stage (tier 0 for stage 0, tier 1 for stage 1).
-STAGE_UP_THRESHOLDS = [0.80, 0.20]
+STAGE_UP_THRESHOLDS = [0.80, 0.40]
 MIN_TIER_EPISODES = 50   # minimum same-tier episodes before checking
 
 
@@ -730,6 +818,14 @@ class _LeagueEnvFn:
         return make_league_env(self._stage_val)
 
 
+def linear_schedule(initial: float, final: float):
+    """Returns a schedule callable accepted by SB3 for lr / ent_coef.
+    progress_remaining goes 1.0 → 0.0 over training."""
+    def schedule(progress_remaining: float) -> float:
+        return final + (initial - final) * progress_remaining
+    return schedule
+
+
 def make_league_env(stage_val):
     env = gymnasium.make(
         "catanatron/Catanatron-v0",
@@ -737,6 +833,7 @@ def make_league_env(stage_val):
     )
     env = CatanRewardWrapper(env)
     env = LeagueWrapper(env, stage_val)
+    env = CatanFeatureWrapper(env)
     env = ActionMasker(env, mask_fn)
     return env
 
@@ -785,18 +882,18 @@ def league_train(
                 env,
                 verbose=1,
                 tensorboard_log=log_dir,
-                learning_rate=3e-4,
+                learning_rate=linear_schedule(3e-4, 1e-5),
                 n_steps=8192,
-                batch_size=512,
+                batch_size=1024,
                 n_epochs=10,
-                gamma=0.999,
+                gamma=0.99,
                 gae_lambda=0.95,
                 clip_range=0.2,
-                ent_coef=0.08,
+                ent_coef=linear_schedule(0.08, 0.01),
                 vf_coef=0.5,
                 max_grad_norm=0.5,
                 device="cpu",
-                policy_kwargs={"net_arch": dict(pi=[256, 256, 256], vf=[256, 256, 256])},
+                policy_kwargs={"net_arch": dict(pi=[512, 256], vf=[512, 256])},
             )
 
         eval_callback = MaskableEvalCallback(
@@ -839,10 +936,13 @@ class PPOPlayer(Player):
         if len(playable_actions) == 1:
             return playable_actions[0]
 
-        obs, _ = self._env.reset()
+        self._env.reset()
         self._env.unwrapped.game = game
         self._env.unwrapped.p0 = self.color
-        obs = self._env.unwrapped._get_obs()
+
+        state = game.state
+        opp_color = next(c for c in state.colors if c != self.color)
+        obs = compute_features(state, self.color, opp_color)
 
         valid_actions = self._env.unwrapped.get_valid_actions()
         action_mask = np.zeros(self._env.action_space.n, dtype=bool)
@@ -933,7 +1033,7 @@ if __name__ == "__main__":
             load_path=args.league_continue,
             save_path=args.save_path,
             log_dir=args.log_dir,
-            total_timesteps=args.timesteps or 2_000_000,
+            total_timesteps=args.timesteps or 5_000_000,
         )
     elif args.league:
         league_train(
