@@ -771,7 +771,7 @@ STAGE_WEIGHTS = [
 # Win-rate threshold (over a rolling window) to advance from each stage.
 # Index matches the stage number; we check win rate against the *primary*
 # tier for that stage (tier 0 for stage 0, tier 1 for stage 1).
-STAGE_UP_THRESHOLDS = [0.80, 0.40]
+STAGE_UP_THRESHOLDS = [0.80, 0.80]
 MIN_TIER_EPISODES = 50   # minimum same-tier episodes before checking
 
 
@@ -964,7 +964,7 @@ def league_train(
 
         eval_callback = MaskableEvalCallback(
             eval_env,
-            best_model_save_path=f"{save_path}/best_league",
+            best_model_save_path=f"{save_path}/best_league2",
             log_path=log_dir,
             eval_freq=eval_freq,
             n_eval_episodes=n_eval_episodes,
@@ -1092,14 +1092,14 @@ if __name__ == "__main__":
             epsilon=args.epsilon,
             save_path=args.save_path,
             log_dir=args.log_dir,
-            total_timesteps=args.timesteps or 5_000_000,
+            total_timesteps=args.timesteps or 15_000_000,
         )
     elif args.league_continue:
         league_train(
             load_path=args.league_continue,
             save_path=args.save_path,
             log_dir=args.log_dir,
-            total_timesteps=args.timesteps or 5_000_000,
+            total_timesteps=args.timesteps or 15_000_000,
         )
     elif args.league:
         league_train(
