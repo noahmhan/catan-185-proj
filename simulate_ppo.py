@@ -35,7 +35,8 @@ from catanatron.gym.envs.action_space import (
 )
 from catanatron.players.minimax import AlphaBetaPlayer
 from catanatron.players.value import ValueFunctionPlayer
-from catanatron.web.utils import ensure_link
+from catanatron.web.models import GameState, database_session
+from catanatron.web.utils import ensure_link, open_link
 
 # ---------------------------------------------------------------------------
 # Paths to trained artefacts
@@ -92,6 +93,12 @@ class PPOPlayer(Player):
             mask[0] = True  # safety fallback
         return mask
 
+    def __reduce__(self):
+        # The Flask server unpickles game states to serve them as JSON, but it
+        # has never imported PPOPlayer. Reconstruct as a plain Player so the
+        # pickle is portable and the server can load the game without errors.
+        return (Player, (self.color, True))
+
     def decide(self, game: Game, playable_actions):
         obs  = self._get_obs(game)
         mask = self._get_action_mask(game)
@@ -136,7 +143,7 @@ def make_opponent(opponent: str, depth: int) -> Player:
 
 
 def play_game(ppo_player: PPOPlayer, opponent: Player, game_num: int) -> tuple:
-    """Play one game to completion, then save the final state once. Returns (winner, url)."""
+    """Play one game, saving every state to the DB in one session for replay. Returns (winner, url)."""
     players = [ppo_player, opponent]
 
     opp_label = type(opponent).__name__
@@ -145,14 +152,25 @@ def play_game(ppo_player: PPOPlayer, opponent: Player, game_num: int) -> tuple:
     print(f"  RED:  {opp_label}")
 
     game = Game(players, vps_to_win=15)
-    game.play()  # run to completion with no DB calls
+
+    # Collect all states during play, then commit once — avoids opening a new
+    # DB engine on every tick (the main performance killer).
+    states = []
+    while game.winning_color() is None:
+        game.play_tick()
+        states.append(GameState.from_game(game))
+
+    with database_session() as session:
+        for gs in states:
+            session.add(gs)
+        session.commit()
 
     winner = game.winning_color()
-    url = ensure_link(game)  # single DB write after the game
+    url = ensure_link(game, get_replay_link=True)
     print(f"  Winner: {winner}")
     print(f"  URL:    {url}")
 
-    return winner, url
+    return winner, url, game
 
 
 def main():
@@ -201,9 +219,10 @@ def main():
 
     results = []
     urls = []
+    last_game = None
     for i in range(1, args.games + 1):
         opponent = make_opponent(args.opponent, args.depth)
-        winner, url = play_game(ppo_player, opponent, i)
+        winner, url, last_game = play_game(ppo_player, opponent, i)
         results.append(winner)
         urls.append(url)
 
@@ -215,9 +234,8 @@ def main():
     for i, url in enumerate(urls, 1):
         print(f"  Game {i}: {url}")
 
-    if not args.no_gui:
-        import webbrowser
-        webbrowser.open(urls[-1])
+    if not args.no_gui and last_game is not None:
+        open_link(last_game)
         print(f"\nOpened last game in browser: {urls[-1]}")
 
 
