@@ -435,6 +435,22 @@ def mask_fn(env) -> np.ndarray:
 # LOGGING CALLBACK
 # ================================================================
 
+class EntropyAnnealCallback(BaseCallback):
+    """Linearly anneals model.ent_coef from initial to final over training.
+    Used because MaskablePPO does not accept a callable for ent_coef."""
+
+    def __init__(self, initial: float, final: float, verbose=0):
+        super().__init__(verbose)
+        self.initial = initial
+        self.final = final
+
+    def _on_step(self) -> bool:
+        progress_remaining = 1.0 - self.num_timesteps / self.model._total_timesteps
+        self.model.ent_coef = self.final + (self.initial - self.final) * progress_remaining
+        self.logger.record("train/ent_coef", self.model.ent_coef)
+        return True
+
+
 class RewardLoggingCallback(BaseCallback):
     """
     Reads per-channel episode stats injected by CatanRewardWrapper and logs
@@ -889,7 +905,7 @@ def league_train(
                 gamma=0.99,
                 gae_lambda=0.95,
                 clip_range=0.2,
-                ent_coef=linear_schedule(0.08, 0.01),
+                ent_coef=0.08,
                 vf_coef=0.5,
                 max_grad_norm=0.5,
                 device="cpu",
@@ -907,7 +923,7 @@ def league_train(
 
         model.learn(
             total_timesteps=total_timesteps,
-            callback=[eval_callback, RewardLoggingCallback(), LeagueAdaptCallback(stage_val)],
+            callback=[eval_callback, RewardLoggingCallback(), LeagueAdaptCallback(stage_val), EntropyAnnealCallback(0.08, 0.01)],
             reset_num_timesteps=(load_path is None),
             progress_bar=True,
         )
@@ -1039,7 +1055,7 @@ if __name__ == "__main__":
         league_train(
             save_path=args.save_path,
             log_dir=args.log_dir,
-            total_timesteps=args.timesteps or 2_000_000,
+            total_timesteps=args.timesteps or 5_000_000,
         )
     elif args.continue_training:
         continue_training(
