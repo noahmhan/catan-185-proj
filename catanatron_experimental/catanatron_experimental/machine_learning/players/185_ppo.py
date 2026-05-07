@@ -448,6 +448,21 @@ def mask_fn(env) -> np.ndarray:
 # LOGGING CALLBACK
 # ================================================================
 
+class EntropyAnnealCallback(BaseCallback):
+    """Linearly anneals model.ent_coef from initial to final over training.
+    Used because MaskablePPO does not accept a callable for ent_coef."""
+
+    def __init__(self, initial: float, final: float, verbose=0):
+        super().__init__(verbose)
+        self.initial = initial
+        self.final = final
+
+    def _on_step(self) -> bool:
+        progress_remaining = 1.0 - self.num_timesteps / self.model._total_timesteps
+        self.model.ent_coef = self.final + (self.initial - self.final) * progress_remaining
+        self.logger.record("train/ent_coef", self.model.ent_coef)
+        return True
+
 class AnnealingCallback(BaseCallback):
     """
     Linearly anneals learning rate and ent_coef over training.
@@ -887,6 +902,14 @@ class _LeagueEnvFn:
         return make_league_env(self._stage_val)
 
 
+def linear_schedule(initial: float, final: float):
+    """Returns a schedule callable accepted by SB3 for lr / ent_coef.
+    progress_remaining goes 1.0 → 0.0 over training."""
+    def schedule(progress_remaining: float) -> float:
+        return final + (initial - final) * progress_remaining
+    return schedule
+
+
 def make_league_env(stage_val):
     env = gymnasium.make(
         "catanatron/Catanatron-v0",
@@ -993,7 +1016,7 @@ def league_train(
         )
         model.learn(
             total_timesteps=total_timesteps,
-            callback=[eval_callback, RewardLoggingCallback(), LeagueAdaptCallback(stage_val), annealing_cb],
+            callback=[eval_callback, RewardLoggingCallback(), LeagueAdaptCallback(stage_val), EntropyAnnealCallback(0.08, 0.01)],
             reset_num_timesteps=(load_path is None),
             progress_bar=True,
         )
