@@ -1,3 +1,4 @@
+import json
 import os
 import random
 import multiprocessing as mp
@@ -447,20 +448,57 @@ def mask_fn(env) -> np.ndarray:
 # LOGGING CALLBACK
 # ================================================================
 
-class EntropyAnnealCallback(BaseCallback):
-    """Linearly anneals model.ent_coef from initial to final over training.
-    Used because MaskablePPO does not accept a callable for ent_coef."""
+class AnnealingCallback(BaseCallback):
+    """
+    Linearly anneals learning rate and ent_coef over training.
 
-    def __init__(self, initial: float, final: float, verbose=0):
+    Progress is measured from the start of THIS run (step_offset is captured
+    in _on_training_start), so --league-continue resumes from the saved values
+    rather than resetting to the initial ones.
+
+    On training end, saves {lr, ent_coef} to state_file so the next
+    --league-continue call can read them as starting values.
+    """
+
+    def __init__(self, start_lr, end_lr, start_ent, end_ent, total_new_steps, state_file, verbose=0):
         super().__init__(verbose)
-        self.initial = initial
-        self.final = final
+        self.start_lr = start_lr
+        self.end_lr = end_lr
+        self.start_ent = start_ent
+        self.end_ent = end_ent
+        self.total_new_steps = total_new_steps
+        self.state_file = state_file
+        self._step_offset = 0
+
+    def _on_training_start(self):
+        # num_timesteps == loaded checkpoint steps (0 for fresh runs)
+        self._step_offset = self.num_timesteps
+        self._apply(0.0)
+
+    def _apply(self, t: float):
+        lr = self.start_lr + (self.end_lr - self.start_lr) * t
+        ent = self.start_ent + (self.end_ent - self.start_ent) * t
+        for param_group in self.model.policy.optimizer.param_groups:
+            param_group["lr"] = lr
+        self.model.ent_coef = ent
+        self.logger.record("train/lr", lr)
+        self.logger.record("train/ent_coef", ent)
 
     def _on_step(self) -> bool:
-        progress_remaining = max(0.0, min(1.0, 1.0 - self.num_timesteps / self.model._total_timesteps))
-        self.model.ent_coef = self.final + (self.initial - self.final) * progress_remaining
-        self.logger.record("train/ent_coef", self.model.ent_coef)
+        steps_into_run = self.num_timesteps - self._step_offset
+        t = min(1.0, steps_into_run / max(1, self.total_new_steps))
+        self._apply(t)
         return True
+
+    def _on_training_end(self):
+        steps_into_run = self.num_timesteps - self._step_offset
+        t = min(1.0, steps_into_run / max(1, self.total_new_steps))
+        lr = self.start_lr + (self.end_lr - self.start_lr) * t
+        ent = self.start_ent + (self.end_ent - self.start_ent) * t
+        os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
+        with open(self.state_file, "w") as f:
+            json.dump({"lr": lr, "ent_coef": ent}, f)
+        print(f"[AnnealingCallback] Saved schedule state: lr={lr:.2e}, ent_coef={ent:.4f}")
 
 
 class RewardLoggingCallback(BaseCallback):
@@ -849,14 +887,6 @@ class _LeagueEnvFn:
         return make_league_env(self._stage_val)
 
 
-def linear_schedule(initial: float, final: float):
-    """Returns a schedule callable accepted by SB3 for lr / ent_coef.
-    progress_remaining goes 1.0 → 0.0 over training."""
-    def schedule(progress_remaining: float) -> float:
-        return final + (initial - final) * progress_remaining
-    return schedule
-
-
 def make_league_env(stage_val):
     env = gymnasium.make(
         "catanatron/Catanatron-v0",
@@ -906,6 +936,16 @@ def league_train(
             env = VecNormalize(SubprocVecEnv(env_fns), norm_obs=False, norm_reward=True, clip_reward=10.0)
         eval_env = VecNormalize(DummyVecEnv([make_env]), norm_obs=False, norm_reward=False, training=False)
 
+        # Load saved schedule values so --league-continue resumes from where
+        # the previous run ended instead of jumping back to initial values.
+        start_lr, start_ent = 3e-4, 0.08
+        if load_path and os.path.exists(LEAGUE_SCHEDULE_STATE):
+            with open(LEAGUE_SCHEDULE_STATE) as f:
+                state = json.load(f)
+            start_lr = state["lr"]
+            start_ent = state["ent_coef"]
+            print(f"[League] Resuming schedules: lr={start_lr:.2e}, ent_coef={start_ent:.4f}")
+
         if load_path:
             model = MaskablePPO.load(load_path, env=env)
             learn_timesteps = max(1, total_timesteps - model.num_timesteps)
@@ -915,23 +955,32 @@ def league_train(
                 env,
                 verbose=1,
                 tensorboard_log=log_dir,
-                learning_rate=linear_schedule(3e-4, 1e-5),
+                learning_rate=start_lr,
                 n_steps=8192,
                 batch_size=1024,
                 n_epochs=10,
                 gamma=0.99,
                 gae_lambda=0.95,
                 clip_range=0.2,
-                ent_coef=0.08,
+                ent_coef=start_ent,
                 vf_coef=0.5,
                 max_grad_norm=0.5,
                 device="cpu",
                 policy_kwargs={"net_arch": dict(pi=[512, 256], vf=[512, 256])},
             )
 
+        annealing_cb = AnnealingCallback(
+            start_lr=start_lr,
+            end_lr=1e-5,
+            start_ent=start_ent,
+            end_ent=0.01,
+            total_new_steps=total_timesteps,
+            state_file=LEAGUE_SCHEDULE_STATE,
+        )
+
         eval_callback = MaskableEvalCallback(
             eval_env,
-            best_model_save_path=f"{save_path}/best_league",
+            best_model_save_path=f"{save_path}/best_league2",
             log_path=log_dir,
             eval_freq=eval_freq,
             n_eval_episodes=n_eval_episodes,
@@ -943,8 +992,8 @@ def league_train(
             else EntropyAnnealCallback(0.08, 0.01)
         )
         model.learn(
-            total_timesteps=learn_timesteps if load_path else total_timesteps,
-            callback=[eval_callback, RewardLoggingCallback(), LeagueAdaptCallback(stage_val), entropy_callback],
+            total_timesteps=total_timesteps,
+            callback=[eval_callback, RewardLoggingCallback(), LeagueAdaptCallback(stage_val), annealing_cb],
             reset_num_timesteps=(load_path is None),
             progress_bar=True,
         )
@@ -1091,7 +1140,7 @@ if __name__ == "__main__":
             epsilon=args.epsilon,
             save_path=args.save_path,
             log_dir=args.log_dir,
-            total_timesteps=args.timesteps or 5_000_000,
+            total_timesteps=args.timesteps or 15_000_000,
         )
     elif args.league_continue:
         league_train(
