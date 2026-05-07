@@ -55,6 +55,7 @@ class CatanatronEnv(gym.Env):
         self.reward_function = self.config.get("reward_function", simple_reward)
         self.map_type = self.config.get("map_type", "BASE")
         self.vps_to_win = self.config.get("vps_to_win", 10)
+        self.discard_limit = self.config.get("discard_limit", 7)
         self.render_mode = self.config.get("render_mode", None)
         self.render_scale = self.config.get("render_scale", 1.0)
         self.renderer = None  # Lazy init on first render()
@@ -178,6 +179,7 @@ class CatanatronEnv(gym.Env):
             seed=seed,
             catan_map=catan_map,
             vps_to_win=self.vps_to_win,
+            discard_limit=self.discard_limit,
         )
         self.invalid_actions_count = 0
 
@@ -250,16 +252,16 @@ By default, it is a 1v1 environment against a random player in the BASE map.
 
 Attributes:
     reward_range: -1 if player lost, 1 if player won, 0 otherwise.
-    action_space: Integers from the [0, 327] interval (in 1v1 BASE). 
+    action_space: Integers from the [0, 327] interval (in 1v1 BASE).
         It is smaller if the MINI map is used. See Action Space table below.
-    observation_space: Numeric Feature Vector. See Observation Space table 
+    observation_space: Numeric Feature Vector. See Observation Space table
         below for quantities. They appear in vector in alphabetical order,
         from the perspective of "current" player (hiding/showing information
         accordingly). P0 is "current" player. P1 is next in line.
-        
+
         We use the following nomenclature for Tile ids and Node ids.
         Edge ids are self-describing (node-id, node-id) tuples. We also
-        use Cube coordinates for tiles (see 
+        use Cube coordinates for tiles (see
         https://www.redblobgames.com/grids/hexagons/#coordinates)
 
 .. image:: _static/tile-ids.png
@@ -298,7 +300,7 @@ CatanatronEnv.__doc__ += """
      - Number of development cards in bank
      - 1
      - Integer
-    
+
    * - EDGE<i>_P<j>_ROAD
      - Whether edge `i` is owned by player `j`
      - 72 * N
@@ -329,7 +331,7 @@ CatanatronEnv.__doc__ += """
      - Float
 
    * - IS_DISCARDING
-     - Whether current player must discard. For now, there is only 1 
+     - Whether current player must discard. For now, there is only 1
        discarding action (at random), since otherwise action space
        would explode in size.
      - 1
@@ -404,8 +406,8 @@ CatanatronEnv.__doc__ += """
        (VICTORY_POINT not included).
      - 4 * N
      - Integer
-   * - 
-     - 
+   * -
+     -
      - 194 * N + 226
-     - 
+     -
 """

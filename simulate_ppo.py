@@ -27,7 +27,7 @@ sys.path.insert(0, os.path.join(ROOT, "catanatron_experimental"))
 from sb3_contrib.ppo_mask import MaskablePPO
 
 from catanatron import Color, Game, Player
-from catanatron.features import get_feature_ordering
+from catanatron.features import create_sample_vector, get_feature_ordering
 from catanatron.gym.envs.action_space import (
     from_action_space,
     get_action_array,
@@ -35,11 +35,16 @@ from catanatron.gym.envs.action_space import (
 )
 from catanatron.players.minimax import AlphaBetaPlayer
 from catanatron.players.value import ValueFunctionPlayer
+from catanatron.players.weighted_random import WeightedRandomPlayer
 from catanatron.web.models import GameState, database_session
 from catanatron.web.utils import ensure_link, open_link
 import importlib as _il
 _ppo_mod = _il.import_module("catanatron_experimental.machine_learning.players.185_ppo")
 compute_features = _ppo_mod.compute_features
+from catanatron_experimental.machine_learning.players.initial_placement_ppo import (
+    encode_board_state as compute_init_placement_features,
+    OBS_DIM as INIT_PLACEMENT_OBS_DIM,
+)
 
 # ---------------------------------------------------------------------------
 # Paths to trained artefacts
@@ -56,12 +61,21 @@ MEDIUM_MODEL  = os.path.join(ROOT, "ppo_medium_eps", "medium_model.zip")
 BEST_MEDIUM   = os.path.join(ROOT, "ppo_medium_eps", "best_medium", "best_model.zip")
 MEDIUM_NORM   = os.path.join(ROOT, "ppo_medium_eps", "vecnormalize_medium.pkl")
 
+# Initial-placement-only model (trained by initial_placement_ppo.py).
+INIT_PLACE_DIR   = os.path.join(
+    ROOT, "catanatron_experimental", "catanatron_experimental",
+    "machine_learning", "players", "initial_placement_model",
+)
+INIT_PLACE_FINAL = os.path.join(INIT_PLACE_DIR, "final_model.zip")
+INIT_PLACE_BEST  = os.path.join(INIT_PLACE_DIR, "best", "best_model.zip")
+
 MODEL_REGISTRY = {
     "league":      (LEAGUE_MODEL, LEAGUE_NORM),
     "best_league": (BEST_LEAGUE,  LEAGUE_NORM),
     "medium":      (MEDIUM_MODEL, MEDIUM_NORM),
     "best_medium": (BEST_MEDIUM,  MEDIUM_NORM),
     "best":        (BEST_MODEL, BEST_NORM),
+    "none":        (None, None),
 }
 
 # ---------------------------------------------------------------------------
@@ -82,9 +96,31 @@ class PPOPlayer(Player):
         super().__init__(color, is_bot=True)
         self.name = name
         self.model = MaskablePPO.load(model_path)
-        print(f"[PPOPlayer] Loaded model from {model_path}")
+        # The shipped checkpoints were trained with two different observation
+        # encoders: the 25-dim hand-crafted vector from 185_ppo.compute_features
+        # (medium / best_medium) and the 614-dim raw catanatron feature vector
+        # (league / best_league / best). Pick the encoder that matches what the
+        # model expects, otherwise the first .predict() call crashes with a
+        # shape error.
+        obs_space = self.model.observation_space
+        if obs_space is None or obs_space.shape is None:
+            raise ValueError(f"Model {model_path} has no Box observation_space")
+        expected_dim = int(obs_space.shape[0])
+        if expected_dim == len(FEATURES):  # 614 — raw catanatron features
+            self._obs_kind = "raw"
+        elif expected_dim == 25:           # hand-crafted compute_features
+            self._obs_kind = "compute"
+        else:
+            raise ValueError(
+                f"Unsupported observation dim {expected_dim} for {model_path}. "
+                f"Expected 25 (compute_features) or {len(FEATURES)} (raw catanatron)."
+            )
+        print(f"[PPOPlayer] Loaded model from {model_path} "
+              f"(obs dim={expected_dim}, encoder={self._obs_kind})")
 
     def _get_obs(self, game: Game) -> np.ndarray:
+        if self._obs_kind == "raw":
+            return np.asarray(create_sample_vector(game, self.color, FEATURES), dtype=np.float32)
         opp_color = Color.RED if self.color == Color.BLUE else Color.BLUE
         return compute_features(game.state, self.color, opp_color)
 
@@ -136,6 +172,49 @@ class PPOPlayer(Player):
         return from_action_space(int(action_int[0]), self.color, PLAYER_COLORS, MAP_TYPE)
 
 
+class InitPlacementPPOPlayer(Player):
+    """Plays the 4 initial placements with a dedicated model that consumes the
+    board-state observation from initial_placement_ppo.encode_board_state, then
+    delegates every other decision to a fallback player."""
+
+    def __init__(self, color: Color, model_path: str, fallback: Player, name: str = "InitPlace"):
+        super().__init__(color, is_bot=True)
+        self.name = name
+        self.model = MaskablePPO.load(model_path)
+        self.fallback = fallback
+
+    def __reduce__(self):
+        return (Player, (self.color, True))
+
+    def decide(self, game: Game, playable_actions):
+        state = game.state
+        if not state.is_initial_build_phase:
+            return self.fallback.decide(game, playable_actions)
+        if len(playable_actions) == 1:
+            return playable_actions[0]
+
+        obs = compute_init_placement_features(state.board, state)
+
+        mask = np.zeros(ACTION_SPACE_SIZE, dtype=bool)
+        idx_to_action = {}
+        for action in playable_actions:
+            try:
+                idx = to_action_space(action, PLAYER_COLORS, MAP_TYPE)
+            except Exception:
+                continue
+            mask[idx] = True
+            idx_to_action[idx] = action
+        if not mask.any():
+            mask[0] = True
+
+        action_idx, _ = self.model.predict(
+            obs[np.newaxis, :],
+            action_masks=mask[np.newaxis, :],
+            deterministic=True,
+        )
+        return idx_to_action.get(int(action_idx[0]), playable_actions[0])
+
+
 # ---------------------------------------------------------------------------
 # Game runner
 # ---------------------------------------------------------------------------
@@ -149,13 +228,14 @@ def make_opponent(opponent: str, depth: int) -> Player:
         raise ValueError(f"Unknown opponent: {opponent}")
 
 
-def play_game(ppo_player: PPOPlayer, opponent: Player, game_num: int) -> tuple:
+def play_game(ppo_player: Player, opponent: Player, game_num: int) -> tuple:
     """Play one game, saving every state to the DB in one session for replay. Returns (winner, url)."""
     players = [ppo_player, opponent]
 
+    blue_label = getattr(ppo_player, "name", type(ppo_player).__name__)
     opp_label = type(opponent).__name__
     print(f"\n=== Game {game_num} ===")
-    print(f"  BLUE: {ppo_player.name}")
+    print(f"  BLUE: {blue_label}")
     print(f"  RED:  {opp_label}")
 
     game = Game(players, vps_to_win=15, discard_limit=7)
@@ -211,18 +291,56 @@ def main():
         action="store_true",
         help="Save to DB but do not open browser at the end",
     )
+    parser.add_argument(
+        "--init-placement",
+        action="store_true",
+        help="Use the initial-placement PPO model for the 4 opening decisions, "
+             "then hand off to --model for the rest of the game.",
+    )
+    parser.add_argument(
+        "--init-placement-path",
+        default=None,
+        help="Path to initial-placement model .zip. Defaults to the eval-best "
+             "checkpoint if present, else final_model.zip.",
+    )
     args = parser.parse_args()
 
     model_path, _ = MODEL_REGISTRY[args.model]
-    if not os.path.exists(model_path):
-        print(f"ERROR: model file not found: {model_path}")
-        sys.exit(1)
 
-    ppo_player = PPOPlayer(
-        color=Color.BLUE,
-        model_path=model_path,
-        name=f"PPO-{args.model}",
-    )
+    if args.model == "none":
+        if not args.init_placement:
+            print("ERROR: --model none only makes sense with --init-placement")
+            sys.exit(1)
+        main_player = WeightedRandomPlayer(Color.BLUE)
+        main_label = "WeightedRandom"
+    else:
+        if not os.path.exists(model_path):
+            print(f"ERROR: model file not found: {model_path}")
+            sys.exit(1)
+        main_player = PPOPlayer(
+            color=Color.BLUE,
+            model_path=model_path,
+            name=f"PPO-{args.model}",
+        )
+        main_label = f"PPO-{args.model}"
+
+    if args.init_placement:
+        ip_path = args.init_placement_path
+        if ip_path is None:
+            ip_path = INIT_PLACE_BEST if os.path.exists(INIT_PLACE_BEST) else INIT_PLACE_FINAL
+        if not os.path.exists(ip_path):
+            print(f"ERROR: initial-placement model not found: {ip_path}")
+            sys.exit(1)
+        ppo_player = InitPlacementPPOPlayer(
+            color=Color.BLUE,
+            model_path=ip_path,
+            fallback=main_player,
+            name=f"InitPlace+{main_label}",
+        )
+        print(f"[InitPlacementPPOPlayer] Loaded init-placement model from {ip_path} "
+              f"(obs dim={INIT_PLACEMENT_OBS_DIM})")
+    else:
+        ppo_player = main_player
 
     results = []
     urls = []

@@ -17,6 +17,9 @@ from catanatron.players.weighted_random import WeightedRandomPlayer
 from catanatron.players.minimax import AlphaBetaPlayer
 from catanatron.players.value import ValueFunctionPlayer
 from catanatron.state_functions import player_key, player_num_resource_cards
+from catanatron.models.enums import ActionType
+from catanatron.gym.envs.action_space import get_action_array
+from catanatron.cli import register_cli_player
 import catanatron.gym
 
 import torch
@@ -24,7 +27,7 @@ torch.distributions.Distribution.set_default_validate_args(False)
 
 
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "ppo_catan_model")
-MODEL_PATH = os.path.join(MODEL_DIR, "final_model")
+MODEL_PATH = os.path.join(os.path.dirname(__file__), "best_ppo", "best_model")
 
 RESOURCE_TYPES = ["WOOD", "BRICK", "SHEEP", "WHEAT", "ORE"]
 
@@ -91,9 +94,12 @@ def network_position_score(state, color):
       (zeroed if robber is on that tile)
     - +0.6 per unique resource type accessible from settlements/cities
     - +0.8 for having >= 1 generic port
-    - +0.4 per specific resource port connected
+    - Per specific-resource port connected: +0.1 baseline + 0.06 per
+      effective pip of that resource owned (so a port with no matching
+      production is nearly worthless, while one fed by 5+ pips matches or
+      exceeds the old flat +0.4)
     - +0.1 per total road + 0.1 per road in longest connected path
-    - +0.04 * (total pips of adjacent tiles) per open settlement spot
+    - +0.06 * (total pips of adjacent tiles) per open settlement spot
       reachable via road network
     """
     board = state.board
@@ -107,6 +113,10 @@ def network_position_score(state, color):
     robber_coordinate = board.robber_coordinate
 
     resource_types_accessible = set()
+    # Effective pips per resource (post-robber, city-doubled). Used by the
+    # port block so a specific-resource port is valued in proportion to how
+    # much of that resource you actually produce.
+    pips_by_resource = {}
 
     # board.buildings is Dict[NodeId, Tuple[Color, FastBuildingType]]
     buildings = board.buildings
@@ -129,6 +139,9 @@ def network_position_score(state, color):
 
             pips = pip_counts.get(tile.number, 0) if tile.number else 0
             score += pips * 0.1 * multiplier
+            pips_by_resource[tile.resource] = (
+                pips_by_resource.get(tile.resource, 0) + pips * multiplier
+            )
 
     # Resource diversity
     score += len(resource_types_accessible) * 0.6
@@ -136,11 +149,13 @@ def network_position_score(state, color):
     # Port access — board.map.port_nodes is Dict[FastResource|None, Set[NodeId]]
     has_generic_port = False
     for resource, node_ids in board.map.port_nodes.items():
-        if any(nid in buildings and buildings[nid][0] == color for nid in node_ids):
-            if resource is None:  # generic 3:1 port
-                has_generic_port = True
-            else:
-                score += 0.4
+        if not any(nid in buildings and buildings[nid][0] == color for nid in node_ids):
+            continue
+        if resource is None:  # generic 3:1 port
+            has_generic_port = True
+        else:
+            matching_pips = pips_by_resource.get(resource, 0)
+            score += 0.1 + 0.06 * matching_pips
 
     if has_generic_port:
         score += 0.8
@@ -159,7 +174,7 @@ def network_position_score(state, color):
         for tile in board.map.adjacent_tiles.get(node_id, []):
             if tile.number:
                 pip_sum += pip_counts.get(tile.number, 0)
-        score += 0.04 * pip_sum
+        score += 0.06 * pip_sum
 
     return score
 
@@ -168,10 +183,15 @@ def vp_proximity_reward(state, color, prev_vps, prev_knights, opp_color):
     """
     VP Proximity Channel (event-based):
     - +1 per VP gained, -1 per VP lost
+    - +0.05 * (my_vps - opp_vps) to reward pulling ahead / penalize falling behind
     - Scaled knight reward based on army achievability
     """
     current_vps = get_victory_points(state, color)
     vp_delta = current_vps - prev_vps
+
+    opp_vps = get_victory_points(state, opp_color)
+    relative_vps = (current_vps - opp_vps)
+    relative_reward = 0.05 * relative_vps
 
     current_knights = get_knights_played(state, color)
     new_knights = current_knights - prev_knights
@@ -189,7 +209,7 @@ def vp_proximity_reward(state, color, prev_vps, prev_knights, opp_color):
             feasibility = min(1.0, 3.0 / knights_needed)
             knight_reward = new_knights * 0.3 * feasibility / (1 + max(0, knights_remaining))
 
-    return float(vp_delta) + knight_reward
+    return float(vp_delta) + relative_reward + knight_reward
 
 
 FEATURE_DIM = 25
@@ -263,15 +283,7 @@ def terminal_reward(game, color):
     if winning_color is None:
         return 0.0
 
-    state = game.state
-    my_vps = get_victory_points(state, color)
-    opp_vps = max(
-        (get_victory_points(state, c) for c in state.colors if c != color),
-        default=0,
-    )
-    vp_margin = 0.5 * (my_vps - opp_vps)
-
-    return (15.0 if winning_color == color else -15.0) + vp_margin
+    return (15.0 if winning_color == color else -15.0)
 
 
 # ================================================================
@@ -445,7 +457,7 @@ class EntropyAnnealCallback(BaseCallback):
         self.final = final
 
     def _on_step(self) -> bool:
-        progress_remaining = 1.0 - self.num_timesteps / self.model._total_timesteps
+        progress_remaining = max(0.0, min(1.0, 1.0 - self.num_timesteps / self.model._total_timesteps))
         self.model.ent_coef = self.final + (self.initial - self.final) * progress_remaining
         self.logger.record("train/ent_coef", self.model.ent_coef)
         return True
@@ -495,6 +507,7 @@ def make_env():
         config={
             "enemies": [WeightedRandomPlayer(Color.RED)],
             "vps_to_win": 15,
+            "discard_limit": 9,
         },
     )
     env = CatanRewardWrapper(env)
@@ -509,6 +522,7 @@ def make_env_hard():
         config={
             "enemies": [AlphaBetaPlayer(Color.RED, depth=1)],
             "vps_to_win": 15,
+            "discard_limit": 9,
         },
     )
     env = CatanRewardWrapper(env)
@@ -523,6 +537,7 @@ def make_env_medium(epsilon=0.4):
         config={
             "enemies": [EpsilonGreedyPlayer(ValueFunctionPlayer(Color.RED), epsilon=epsilon)],
             "vps_to_win": 15,
+            "discard_limit": 9,
         },
     )
     env = CatanRewardWrapper(env)
@@ -718,21 +733,21 @@ def continue_training(
 # WeightedRandom and AlphaBeta on the leaderboard.
 OPPONENT_TIERS = [
     ("easy",   lambda: WeightedRandomPlayer(Color.RED)),
-    ("medium", lambda: ValueFunctionPlayer(Color.RED)),
-    ("hard",   lambda: AlphaBetaPlayer(Color.RED, depth=1)),
+    ("medium",   lambda: AlphaBetaPlayer(Color.RED, depth=1)),
+    ("hard", lambda: ValueFunctionPlayer(Color.RED)),
 ]
 
 # Sampling weights [easy, medium, hard] per stage
 STAGE_WEIGHTS = [
     [0.80, 0.20, 0.00],   # Stage 0: build basics vs WeightedRandom
     [0.30, 0.50, 0.20],   # Stage 1: focus on MCTS, keep basics
-    [0.10, 0.30, 0.60],   # Stage 2: sharpen vs AlphaBeta
+    [0.20, 0.40, 0.40],   # Stage 2: sharpen vs AlphaBeta
 ]
 
 # Win-rate threshold (over a rolling window) to advance from each stage.
 # Index matches the stage number; we check win rate against the *primary*
 # tier for that stage (tier 0 for stage 0, tier 1 for stage 1).
-STAGE_UP_THRESHOLDS = [0.80, 0.40]
+STAGE_UP_THRESHOLDS = [0.80, 0.50]
 MIN_TIER_EPISODES = 50   # minimum same-tier episodes before checking
 
 
@@ -845,7 +860,7 @@ def linear_schedule(initial: float, final: float):
 def make_league_env(stage_val):
     env = gymnasium.make(
         "catanatron/Catanatron-v0",
-        config={"enemies": [WeightedRandomPlayer(Color.RED)], "vps_to_win": 15},
+        config={"enemies": [WeightedRandomPlayer(Color.RED)], "vps_to_win": 15, "discard_limit": 9},
     )
     env = CatanRewardWrapper(env)
     env = LeagueWrapper(env, stage_val)
@@ -862,6 +877,7 @@ def league_train(
     n_eval_episodes=20,
     n_envs=4,
     load_path=None,
+    start_stage=0,
 ):
     """
     Train (or fine-tune) with opponent sampling / league training.
@@ -879,7 +895,7 @@ def league_train(
     # Manager creates a server process that owns the value; the returned
     # proxy is picklable so SubprocVecEnv workers can share it via spawn.
     with mp.Manager() as manager:
-        stage_val = manager.Value("i", 0)
+        stage_val = manager.Value("i", start_stage)
         env_fns: list = [_LeagueEnvFn(stage_val) for _ in range(n_envs)]
         vec_normalize_path = os.path.join(save_path, "vecnormalize.pkl")
         if load_path and os.path.exists(vec_normalize_path):
@@ -892,6 +908,7 @@ def league_train(
 
         if load_path:
             model = MaskablePPO.load(load_path, env=env)
+            learn_timesteps = max(1, total_timesteps - model.num_timesteps)
         else:
             model = MaskablePPO(
                 MaskableActorCriticPolicy,
@@ -921,9 +938,13 @@ def league_train(
             deterministic=True,
         )
 
+        entropy_callback = (
+            EntropyAnnealCallback(0.01, 0.005) if load_path
+            else EntropyAnnealCallback(0.08, 0.01)
+        )
         model.learn(
-            total_timesteps=total_timesteps,
-            callback=[eval_callback, RewardLoggingCallback(), LeagueAdaptCallback(stage_val), EntropyAnnealCallback(0.08, 0.01)],
+            total_timesteps=learn_timesteps if load_path else total_timesteps,
+            callback=[eval_callback, RewardLoggingCallback(), LeagueAdaptCallback(stage_val), entropy_callback],
             reset_num_timesteps=(load_path is None),
             progress_bar=True,
         )
@@ -940,32 +961,54 @@ def league_train(
 # PLAYER CLASS
 # ================================================================
 
+# Action array the model was trained with (BLUE=agent, RED=opponent).
+# Cached at module level so PPOPlayer instances don't rebuild it each call.
+_TRAINING_COLORS = (Color.BLUE, Color.RED)
+_ACTIONS_ARRAY = get_action_array(_TRAINING_COLORS, "BASE")
+_ACTION_SPACE_SIZE = len(_ACTIONS_ARRAY)
+
+
 class PPOPlayer(Player):
-    """Catanatron Player that uses a trained MaskablePPO model to decide actions."""
+    """PPO-trained bot. Use code PPO in the CLI, e.g. --players=PPO,H."""
 
     def __init__(self, color, model_path=MODEL_PATH):
-        super().__init__(color)
+        super().__init__(color, is_bot=True)
         self.model = MaskablePPO.load(model_path)
-        self._env = gymnasium.make("catanatron/Catanatron-v0")
 
     def decide(self, game, playable_actions):
         if len(playable_actions) == 1:
             return playable_actions[0]
 
-        self._env.reset()
-        self._env.unwrapped.game = game
-        self._env.unwrapped.p0 = self.color
-
         state = game.state
         opp_color = next(c for c in state.colors if c != self.color)
         obs = compute_features(state, self.color, opp_color)
 
-        valid_actions = self._env.unwrapped.get_valid_actions()
-        action_mask = np.zeros(self._env.action_space.n, dtype=bool)
-        action_mask[valid_actions] = True
+        # Map each playable action to its index in the training action array.
+        # MOVE_ROBBER actions embed victim colors; remap self.color→BLUE and
+        # opp_color→RED so indices match what the model was trained against.
+        mask = np.zeros(_ACTION_SPACE_SIZE, dtype=bool)
+        idx_to_action = {}
+        for action in playable_actions:
+            value = action.value
+            if action.action_type == ActionType.MOVE_ROBBER and value is not None:
+                coords, victim = value
+                if victim == self.color:
+                    victim = Color.BLUE
+                elif victim == opp_color:
+                    victim = Color.RED
+                value = (coords, victim)
+            try:
+                gym_idx = _ACTIONS_ARRAY.index((action.action_type, value))
+                mask[gym_idx] = True
+                idx_to_action[gym_idx] = action
+            except ValueError:
+                pass  # action not in training space; will never be selected
 
-        action, _ = self.model.predict(obs, action_masks=action_mask, deterministic=True)
-        return self._env.unwrapped.actions[action]
+        action_idx, _ = self.model.predict(obs, action_masks=mask, deterministic=True)
+        return idx_to_action.get(int(action_idx), playable_actions[0])
+
+
+register_cli_player("PPO", PPOPlayer)
 
 
 if __name__ == "__main__":
@@ -1018,6 +1061,12 @@ if __name__ == "__main__":
         help="Override total_timesteps for any training mode",
     )
     parser.add_argument(
+        "--start-stage",
+        type=int,
+        default=0,
+        help="League stage to resume from when using --league-continue (0=easy, 1=medium, 2=hard)",
+    )
+    parser.add_argument(
         "--save-path",
         default=MODEL_DIR,
         help=f"Directory to save the model (default: {MODEL_DIR})",
@@ -1050,6 +1099,7 @@ if __name__ == "__main__":
             save_path=args.save_path,
             log_dir=args.log_dir,
             total_timesteps=args.timesteps or 5_000_000,
+            start_stage=args.start_stage,
         )
     elif args.league:
         league_train(
