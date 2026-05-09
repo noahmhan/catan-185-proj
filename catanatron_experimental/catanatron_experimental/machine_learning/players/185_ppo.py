@@ -92,15 +92,15 @@ def resource_flow_score(state, color):
 def network_position_score(state, color):
     """
     Network Position Channel (score function, reward = delta between turns):
-    - +0.1 per production pip covered by settlements (doubled for cities)
+    - +0.15 per production pip covered by settlements (doubled for cities)
       (zeroed if robber is on that tile)
-    - +0.6 per unique resource type accessible from settlements/cities
-    - +0.8 for having >= 1 generic port
-    - Per specific-resource port connected: +0.1 baseline + 0.06 per
-      effective pip of that resource owned (so a port with no matching
-      production is nearly worthless, while one fed by 5+ pips matches or
-      exceeds the old flat +0.4)
-    - +0.1 per total road + 0.1 per road in longest connected path
+    - +0.8 per unique resource type accessible from settlements/cities
+    - +0.2 for having >= 1 generic port
+    - Per specific-resource port connected: +0.05 per effective pip of that
+      resource owned (so a port with no matching production is worthless;
+      one fed by 5+ pips is worth ~0.25)
+    - +0.03 per total road (longest-road bonus removed — already counted
+      via the VP-delta channel; was double-counting)
     - +0.06 * (total pips of adjacent tiles) per open settlement spot
       reachable via road network
     """
@@ -140,13 +140,13 @@ def network_position_score(state, color):
                 continue
 
             pips = pip_counts.get(tile.number, 0) if tile.number else 0
-            score += pips * 0.1 * multiplier
+            score += pips * 0.15 * multiplier
             pips_by_resource[tile.resource] = (
                 pips_by_resource.get(tile.resource, 0) + pips * multiplier
             )
 
     # Resource diversity
-    score += len(resource_types_accessible) * 0.6
+    score += len(resource_types_accessible) * 0.8
 
     # Port access — board.map.port_nodes is Dict[FastResource|None, Set[NodeId]]
     has_generic_port = False
@@ -157,16 +157,15 @@ def network_position_score(state, color):
             has_generic_port = True
         else:
             matching_pips = pips_by_resource.get(resource, 0)
-            score += 0.1 + 0.06 * matching_pips
+            score += 0.05 * matching_pips
 
     if has_generic_port:
-        score += 0.8
+        score += 0.2
 
-    # Road network
+    # Road network — longest-road VP already flows through vp_proximity_reward
     roads = [(edge, c) for edge, c in board.roads.items() if c == color]
     num_roads = len(roads) // 2  # roads stored bidirectionally
-    longest_road = get_longest_road_length(state, color)
-    score += num_roads * 0.1 + longest_road * 0.1
+    score += num_roads * 0.03
 
     # Open settlement spots weighted by pip quality
     subgraphs = board.find_connected_components(color)
@@ -289,9 +288,18 @@ def terminal_reward(game, color):
 
 class CatanRewardWrapper(Wrapper):
     """
-    Wraps Catanatron-v0 to provide the composite reward (resource flow +
-    network position delta + VP proximity + terminal) used by the PPO baseline.
-    Replaces the reward_function config param, which can't track state across steps.
+    Wraps Catanatron-v0 to provide the composite reward (cumulative resource
+    throughput + 0.3 * network position delta + VP proximity + terminal) used
+    by the PPO baseline. Replaces the reward_function config param, which
+    can't track state across steps.
+
+    Resource channel rewards throughput, not stock:
+      + EARN_REWARD per card gained (positive hand delta from any source)
+      + SPEND_REWARD per card spent on a build (negative hand delta in the
+        same step that a new building or road appeared for us)
+      − HOARD_PENALTY per card over 9 (held-step rate)
+    Hand drops with no concurrent build (discards on 7, robbed, monopolized)
+    give 0 — neither rewarded nor punished.
 
     On episode end, injects per-channel episode totals and win flag into info:
         info["ep_r_resource"], info["ep_r_position"], info["ep_r_vp"],
@@ -299,11 +307,17 @@ class CatanRewardWrapper(Wrapper):
     These are picked up by RewardLoggingCallback for TensorBoard.
     """
 
+    EARN_REWARD = 0.05
+    SPEND_REWARD = 0.05
+    HOARD_PENALTY = 0.05
+
     def __init__(self, env):
         super().__init__(env)
         self.p0_color = Color.BLUE
         self.opp_color = Color.RED
-        self._prev_resource_score = 0.0
+        self._prev_hand_size = 0
+        self._prev_building_count = 0
+        self._prev_road_count = 0
         self._prev_position_score = 0.0
         self._prev_vps = 0
         self._prev_knights = 0
@@ -312,10 +326,20 @@ class CatanRewardWrapper(Wrapper):
         self._ep_r_vp = 0.0
         self._ep_r_terminal = 0.0
 
+    def _building_count(self, state):
+        return sum(
+            1 for _, (c, _) in state.board.buildings.items() if c == self.p0_color
+        )
+
+    def _road_count(self, state):
+        return sum(1 for _, c in state.board.roads.items() if c == self.p0_color) // 2
+
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
         state = self.env.unwrapped.game.state
-        self._prev_resource_score = resource_flow_score(state, self.p0_color)
+        self._prev_hand_size = get_hand_size(state, self.p0_color)
+        self._prev_building_count = self._building_count(state)
+        self._prev_road_count = self._road_count(state)
         self._prev_position_score = network_position_score(state, self.p0_color)
         self._prev_vps = get_victory_points(state, self.p0_color)
         self._prev_knights = get_knights_played(state, self.p0_color)
@@ -337,11 +361,27 @@ class CatanRewardWrapper(Wrapper):
         state = game.state
         done = terminated or truncated
 
-        # Resource flow: delta-based so it only fires when hand composition changes.
-        # Typical delta: ±0.1–0.5 per step.
-        current_resource = resource_flow_score(state, self.p0_color)
-        r_resource = current_resource - self._prev_resource_score
-        self._prev_resource_score = current_resource
+        # Resource: cumulative throughput (earn + spend-on-build − hoard).
+        cur_hand = get_hand_size(state, self.p0_color)
+        cur_buildings = self._building_count(state)
+        cur_roads = self._road_count(state)
+        delta_hand = cur_hand - self._prev_hand_size
+        built_something = (
+            cur_buildings > self._prev_building_count
+            or cur_roads > self._prev_road_count
+        )
+
+        r_resource = 0.0
+        if delta_hand > 0:
+            r_resource += self.EARN_REWARD * delta_hand
+        elif delta_hand < 0 and built_something:
+            r_resource += self.SPEND_REWARD * (-delta_hand)
+        if cur_hand > 9:
+            r_resource -= self.HOARD_PENALTY * (cur_hand - 9)
+
+        self._prev_hand_size = cur_hand
+        self._prev_building_count = cur_buildings
+        self._prev_road_count = cur_roads
 
         # Network position: delta-based; scaled by 0.3 so build events (+3–8 raw)
         # land at ~+1–2, comparable to a VP gain.
