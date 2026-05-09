@@ -11,6 +11,7 @@ Usage:
     python simulate_ppo.py --games 3                    # play 3 games (default 1)
     python simulate_ppo.py --depth 1                    # AlphaBeta depth (default 2)
     python simulate_ppo.py --no-gui                     # skip opening browser at end
+    python simulate_ppo.py --alphabeta-init             # AlphaBeta n=2 plays initial placements
 """
 
 import argparse
@@ -215,6 +216,26 @@ class InitPlacementPPOPlayer(Player):
         return idx_to_action.get(int(action_idx[0]), playable_actions[0])
 
 
+class AlphaBetaInitPlacementPlayer(Player):
+    """Plays the initial build phase with an AlphaBetaPlayer, then delegates
+    every other decision to a fallback player."""
+
+    def __init__(self, color: Color, depth: int, fallback: Player, name: str = "ABInitPlace"):
+        super().__init__(color, is_bot=True)
+        self.name = name
+        self.depth = depth
+        self.alphabeta = AlphaBetaPlayer(color, depth=depth)
+        self.fallback = fallback
+
+    def __reduce__(self):
+        return (Player, (self.color, True))
+
+    def decide(self, game: Game, playable_actions):
+        if game.state.is_initial_build_phase:
+            return self.alphabeta.decide(game, playable_actions)
+        return self.fallback.decide(game, playable_actions)
+
+
 # ---------------------------------------------------------------------------
 # Game runner
 # ---------------------------------------------------------------------------
@@ -303,13 +324,29 @@ def main():
         help="Path to initial-placement model .zip. Defaults to the eval-best "
              "checkpoint if present, else final_model.zip.",
     )
+    parser.add_argument(
+        "--alphabeta-init",
+        action="store_true",
+        help="Use AlphaBetaPlayer for the initial placements, then hand off to "
+             "--model for the rest of the game. Mutually exclusive with --init-placement.",
+    )
+    parser.add_argument(
+        "--alphabeta-init-depth",
+        type=int,
+        default=2,
+        help="Depth for the AlphaBeta initial-placement player (default: 2).",
+    )
     args = parser.parse_args()
+
+    if args.init_placement and args.alphabeta_init:
+        print("ERROR: --init-placement and --alphabeta-init are mutually exclusive")
+        sys.exit(1)
 
     model_path, _ = MODEL_REGISTRY[args.model]
 
     if args.model == "none":
-        if not args.init_placement:
-            print("ERROR: --model none only makes sense with --init-placement")
+        if not (args.init_placement or args.alphabeta_init):
+            print("ERROR: --model none only makes sense with --init-placement or --alphabeta-init")
             sys.exit(1)
         main_player = WeightedRandomPlayer(Color.BLUE)
         main_label = "WeightedRandom"
@@ -339,6 +376,15 @@ def main():
         )
         print(f"[InitPlacementPPOPlayer] Loaded init-placement model from {ip_path} "
               f"(obs dim={INIT_PLACEMENT_OBS_DIM})")
+    elif args.alphabeta_init:
+        ppo_player = AlphaBetaInitPlacementPlayer(
+            color=Color.BLUE,
+            depth=args.alphabeta_init_depth,
+            fallback=main_player,
+            name=f"AB{args.alphabeta_init_depth}Init+{main_label}",
+        )
+        print(f"[AlphaBetaInitPlacementPlayer] AlphaBeta(depth={args.alphabeta_init_depth}) "
+              f"will play initial placements, then hand off to {main_label}")
     else:
         ppo_player = main_player
 
