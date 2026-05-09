@@ -29,6 +29,7 @@ torch.distributions.Distribution.set_default_validate_args(False)
 
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "ppo_catan_model")
 MODEL_PATH = os.path.join(os.path.dirname(__file__), "best_ppo", "best_model")
+LEAGUE_SCHEDULE_STATE = os.path.join(MODEL_DIR, "league_schedule_state.json")
 
 RESOURCE_TYPES = ["WOOD", "BRICK", "SHEEP", "WHEAT", "ORE"]
 
@@ -180,19 +181,21 @@ def network_position_score(state, color):
     return score
 
 
-def vp_proximity_reward(state, color, prev_vps, prev_knights, opp_color):
+def vp_proximity_reward(state, color, prev_vps, prev_knights, prev_opp_vps, opp_color):
     """
     VP Proximity Channel (event-based):
     - +1 per VP gained, -1 per VP lost
-    - +0.05 * (my_vps - opp_vps) to reward pulling ahead / penalize falling behind
+    - +0.5 * change in (my_vps - opp_vps) to reward pulling ahead /
+      penalize falling behind. Delta-based so the agent can't farm a
+      static lead by stalling.
     - Scaled knight reward based on army achievability
     """
     current_vps = get_victory_points(state, color)
     vp_delta = current_vps - prev_vps
 
     opp_vps = get_victory_points(state, opp_color)
-    relative_vps = (current_vps - opp_vps)
-    relative_reward = 0.05 * relative_vps
+    relative_change = (current_vps - opp_vps) - (prev_vps - prev_opp_vps)
+    relative_reward = 0.5 * relative_change
 
     current_knights = get_knights_played(state, color)
     new_knights = current_knights - prev_knights
@@ -310,6 +313,7 @@ class CatanRewardWrapper(Wrapper):
         self._prev_resource_score = 0.0
         self._prev_position_score = 0.0
         self._prev_vps = 0
+        self._prev_opp_vps = 0
         self._prev_knights = 0
         self._ep_r_resource = 0.0
         self._ep_r_position = 0.0
@@ -322,6 +326,7 @@ class CatanRewardWrapper(Wrapper):
         self._prev_resource_score = resource_flow_score(state, self.p0_color)
         self._prev_position_score = network_position_score(state, self.p0_color)
         self._prev_vps = get_victory_points(state, self.p0_color)
+        self._prev_opp_vps = get_victory_points(state, self.opp_color)
         self._prev_knights = get_knights_played(state, self.p0_color)
         self._ep_r_resource = 0.0
         self._ep_r_position = 0.0
@@ -356,9 +361,10 @@ class CatanRewardWrapper(Wrapper):
         r_vp = vp_proximity_reward(
             state, self.p0_color,
             self._prev_vps, self._prev_knights,
-            self.opp_color,
+            self._prev_opp_vps, self.opp_color,
         )
         self._prev_vps = get_victory_points(state, self.p0_color)
+        self._prev_opp_vps = get_victory_points(state, self.opp_color)
         self._prev_knights = get_knights_played(state, self.p0_color)
 
         r_terminal = terminal_reward(game, self.p0_color) if done else 0.0
@@ -792,7 +798,7 @@ OPPONENT_TIERS = [
 
 # Sampling weights [easy, medium, hard] per stage
 STAGE_WEIGHTS = [
-    [0.80, 0.20, 0.00],   # Stage 0: build basics vs WeightedRandom
+    [0.70, 0.20, 0.10],   # Stage 0: build basics vs WeightedRandom
     [0.30, 0.50, 0.20],   # Stage 1: focus on MCTS, keep basics
     [0.20, 0.40, 0.40],   # Stage 2: sharpen vs AlphaBeta
 ]
@@ -961,7 +967,7 @@ def league_train(
 
         # Load saved schedule values so --league-continue resumes from where
         # the previous run ended instead of jumping back to initial values.
-        start_lr, start_ent = 3e-4, 0.08
+        start_lr, start_ent = 3e-4, 0.02
         if load_path and os.path.exists(LEAGUE_SCHEDULE_STATE):
             with open(LEAGUE_SCHEDULE_STATE) as f:
                 state = json.load(f)
@@ -982,7 +988,7 @@ def league_train(
                 n_steps=8192,
                 batch_size=1024,
                 n_epochs=10,
-                gamma=0.99,
+                gamma=0.999,
                 gae_lambda=0.95,
                 clip_range=0.2,
                 ent_coef=start_ent,
@@ -996,7 +1002,7 @@ def league_train(
             start_lr=start_lr,
             end_lr=1e-5,
             start_ent=start_ent,
-            end_ent=0.01,
+            end_ent=0.003,
             total_new_steps=total_timesteps,
             state_file=LEAGUE_SCHEDULE_STATE,
         )
@@ -1010,13 +1016,9 @@ def league_train(
             deterministic=True,
         )
 
-        entropy_callback = (
-            EntropyAnnealCallback(0.01, 0.005) if load_path
-            else EntropyAnnealCallback(0.08, 0.01)
-        )
         model.learn(
             total_timesteps=total_timesteps,
-            callback=[eval_callback, RewardLoggingCallback(), LeagueAdaptCallback(stage_val), EntropyAnnealCallback(0.08, 0.01)],
+            callback=[eval_callback, RewardLoggingCallback(), LeagueAdaptCallback(stage_val), annealing_cb],
             reset_num_timesteps=(load_path is None),
             progress_bar=True,
         )
@@ -1038,6 +1040,7 @@ def league_train(
 _TRAINING_COLORS = (Color.BLUE, Color.RED)
 _ACTIONS_ARRAY = get_action_array(_TRAINING_COLORS, "BASE")
 _ACTION_SPACE_SIZE = len(_ACTIONS_ARRAY)
+_ACTION_TO_IDX = {entry: i for i, entry in enumerate(_ACTIONS_ARRAY)}
 
 
 class PPOPlayer(Player):
@@ -1069,12 +1072,10 @@ class PPOPlayer(Player):
                 elif victim == opp_color:
                     victim = Color.RED
                 value = (coords, victim)
-            try:
-                gym_idx = _ACTIONS_ARRAY.index((action.action_type, value))
+            gym_idx = _ACTION_TO_IDX.get((action.action_type, value))
+            if gym_idx is not None:
                 mask[gym_idx] = True
                 idx_to_action[gym_idx] = action
-            except ValueError:
-                pass  # action not in training space; will never be selected
 
         action_idx, _ = self.model.predict(obs, action_masks=mask, deterministic=True)
         return idx_to_action.get(int(action_idx), playable_actions[0])
