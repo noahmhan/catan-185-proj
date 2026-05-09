@@ -181,21 +181,14 @@ def network_position_score(state, color):
     return score
 
 
-def vp_proximity_reward(state, color, prev_vps, prev_knights, prev_opp_vps, opp_color):
+def vp_proximity_reward(state, color, prev_vps, prev_knights, opp_color):
     """
     VP Proximity Channel (event-based):
     - +1 per VP gained, -1 per VP lost
-    - +0.5 * change in (my_vps - opp_vps) to reward pulling ahead /
-      penalize falling behind. Delta-based so the agent can't farm a
-      static lead by stalling.
     - Scaled knight reward based on army achievability
     """
     current_vps = get_victory_points(state, color)
     vp_delta = current_vps - prev_vps
-
-    opp_vps = get_victory_points(state, opp_color)
-    relative_change = (current_vps - opp_vps) - (prev_vps - prev_opp_vps)
-    relative_reward = 0.5 * relative_change
 
     current_knights = get_knights_played(state, color)
     new_knights = current_knights - prev_knights
@@ -213,7 +206,7 @@ def vp_proximity_reward(state, color, prev_vps, prev_knights, prev_opp_vps, opp_
             feasibility = min(1.0, 3.0 / knights_needed)
             knight_reward = new_knights * 0.3 * feasibility / (1 + max(0, knights_remaining))
 
-    return float(vp_delta) + relative_reward + knight_reward
+    return float(vp_delta) + knight_reward
 
 
 FEATURE_DIM = 25
@@ -313,7 +306,6 @@ class CatanRewardWrapper(Wrapper):
         self._prev_resource_score = 0.0
         self._prev_position_score = 0.0
         self._prev_vps = 0
-        self._prev_opp_vps = 0
         self._prev_knights = 0
         self._ep_r_resource = 0.0
         self._ep_r_position = 0.0
@@ -326,7 +318,6 @@ class CatanRewardWrapper(Wrapper):
         self._prev_resource_score = resource_flow_score(state, self.p0_color)
         self._prev_position_score = network_position_score(state, self.p0_color)
         self._prev_vps = get_victory_points(state, self.p0_color)
-        self._prev_opp_vps = get_victory_points(state, self.opp_color)
         self._prev_knights = get_knights_played(state, self.p0_color)
         self._ep_r_resource = 0.0
         self._ep_r_position = 0.0
@@ -361,10 +352,9 @@ class CatanRewardWrapper(Wrapper):
         r_vp = vp_proximity_reward(
             state, self.p0_color,
             self._prev_vps, self._prev_knights,
-            self._prev_opp_vps, self.opp_color,
+            self.opp_color,
         )
         self._prev_vps = get_victory_points(state, self.p0_color)
-        self._prev_opp_vps = get_victory_points(state, self.opp_color)
         self._prev_knights = get_knights_played(state, self.p0_color)
 
         r_terminal = terminal_reward(game, self.p0_color) if done else 0.0
