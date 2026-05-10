@@ -96,12 +96,21 @@ def _import_schra():
     spec = importlib.util.spec_from_file_location("schra", path)
     schra = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
+    # NOTE: deliberately NOT registering this module in sys.modules.
+    # Doing so would make cloudpickle treat schra-defined classes as
+    # "importable by reference" and serialize them as module="schra",
+    # which then fails to unpickle inside SubprocVecEnv forkserver workers
+    # (those workers start clean and can't `import schra`). Keeping it out
+    # of sys.modules forces cloudpickle to fall back to by-value pickling,
+    # which works in workers. Pickling that runs in this main process
+    # (e.g. the replay-buffer checkpoint) is handled inside sc-hra.py by
+    # avoiding namedtuple / module-bound types in the saved blob.
     spec.loader.exec_module(schra)
     return schra
 
 
 @app.function(
-    gpu="H100",
+    cpu=16,
     volumes={"/data": volume},
     timeout=24 * 60 * 60,  # 24h cap; bump if a run will exceed this
 )
@@ -109,8 +118,9 @@ def run_league(
     timesteps: int = 5_000_000,
     save_name: str = "default",
     start_stage: int = 0,
-    device: str = "gpu",
+    device: str = "cpu",
     resume_from: str = "",
+    n_envs: int = 15,
 ):
     """Launches sc-hra's league_train inside a GPU container.
 
@@ -145,6 +155,7 @@ def run_league(
         start_stage=start_stage,
         device=device,
         resume_path=resume_path,
+        n_envs=n_envs,
     )
 
     # Make new files visible to other containers / `modal volume get`.
@@ -181,8 +192,9 @@ def main(
     timesteps: int = 5_000_000,
     save_name: str = "default",
     start_stage: int = 0,
-    device: str = "gpu",
+    device: str = "cpu",
     resume_from: str = "",
+    n_envs: int = 15,
 ):
     """`modal run modal_train.py --timesteps 30000000 --save-name run1` etc."""
     run_league.remote(
@@ -191,4 +203,5 @@ def main(
         start_stage=start_stage,
         device=device,
         resume_from=resume_from,
+        n_envs=n_envs,
     )

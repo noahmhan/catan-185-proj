@@ -1030,7 +1030,7 @@ def league_train(
 
         annealing_cb = AnnealingCallback(
             start_lr=start_lr,
-            end_lr=1e-5,
+            end_lr=1e-4,
             start_ent=start_ent,
             end_ent=0.003,
             total_new_steps=total_timesteps,
