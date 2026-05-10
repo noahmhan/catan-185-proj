@@ -12,14 +12,16 @@ Requirements:
 import os
 import random
 import math
+import time
 from collections import deque, namedtuple
- 
+
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 from torch.utils.tensorboard import SummaryWriter
+from stable_baselines3.common.logger import configure as configure_sb3_logger
  
 import gymnasium
 from gymnasium import Wrapper
@@ -38,6 +40,40 @@ import catanatron.gym
 DEVICE = torch.device("cpu")
 FEATURE_DIM = 25
 N_CHANNELS = 3  # resource, position, vp
+
+
+def _resolve_device(name: str) -> torch.device:
+    """Map a CLI device string to a torch.device.
+
+    "cpu"  → CPU
+    "cuda" → NVIDIA GPU (errors if unavailable)
+    "mps"  → Apple Silicon GPU (errors if unavailable)
+    "gpu" / "auto" → cuda if available, else mps, else cpu
+
+    Sets PYTORCH_ENABLE_MPS_FALLBACK=1 when MPS is selected so torch falls
+    back to CPU for ops not yet implemented on the MPS backend.
+    """
+    name = name.lower()
+    if name == "cpu":
+        return torch.device("cpu")
+    if name == "cuda":
+        if not torch.cuda.is_available():
+            raise RuntimeError("--device cuda requested but CUDA is not available")
+        return torch.device("cuda")
+    if name == "mps":
+        if not (hasattr(torch.backends, "mps") and torch.backends.mps.is_available()):
+            raise RuntimeError("--device mps requested but MPS is not available")
+        os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+        return torch.device("mps")
+    if name in ("gpu", "auto"):
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+            return torch.device("mps")
+        print("[device] No GPU available, falling back to CPU.")
+        return torch.device("cpu")
+    raise ValueError(f"Unknown device: {name!r}")
  
 RESOURCE_TYPES = ["WOOD", "BRICK", "SHEEP", "WHEAT", "ORE"]
  
@@ -85,14 +121,29 @@ def resource_flow_score(state, color):
  
  
 def network_position_score(state, color):
+    """
+    Network Position Channel (score function, reward = delta between turns):
+    - +0.15 per production pip covered by settlements (doubled for cities)
+      (zeroed if robber is on that tile)
+    - +0.8 per unique resource type accessible from settlements/cities
+    - +0.2 for having >= 1 generic port
+    - Per specific-resource port connected: +0.05 per effective pip of that
+      resource owned (so a port with no matching production is worthless;
+      one fed by 5+ pips is worth ~0.25)
+    - +0.03 per total road (longest-road bonus removed — already counted
+      via the VP-delta channel; was double-counting)
+    - +0.06 * (total pips of adjacent tiles) per open settlement spot
+      reachable via road network
+    """
     board = state.board
     score = 0.0
     pip_counts = {2: 1, 3: 2, 4: 3, 5: 4, 6: 5, 7: 0, 8: 5, 9: 4, 10: 3, 11: 2, 12: 1}
     tile_coord = {tile.id: coord for coord, tile in board.map.land_tiles.items()}
     robber_coordinate = board.robber_coordinate
     resource_types_accessible = set()
+    pips_by_resource = {}
     buildings = board.buildings
- 
+
     for node_id, (bldg_color, bldg_type) in buildings.items():
         if bldg_color != color:
             continue
@@ -104,25 +155,29 @@ def network_position_score(state, color):
             if tile_coord.get(tile.id) == robber_coordinate:
                 continue
             pips = pip_counts.get(tile.number, 0) if tile.number else 0
-            score += pips * 0.1 * multiplier
- 
-    score += len(resource_types_accessible) * 0.6
- 
+            score += pips * 0.15 * multiplier
+            pips_by_resource[tile.resource] = (
+                pips_by_resource.get(tile.resource, 0) + pips * multiplier
+            )
+
+    score += len(resource_types_accessible) * 0.8
+
     has_generic_port = False
     for resource, node_ids in board.map.port_nodes.items():
-        if any(nid in buildings and buildings[nid][0] == color for nid in node_ids):
-            if resource is None:
-                has_generic_port = True
-            else:
-                score += 0.4
+        if not any(nid in buildings and buildings[nid][0] == color for nid in node_ids):
+            continue
+        if resource is None:
+            has_generic_port = True
+        else:
+            matching_pips = pips_by_resource.get(resource, 0)
+            score += 0.05 * matching_pips
     if has_generic_port:
-        score += 0.8
- 
+        score += 0.2
+
     roads = [(edge, c) for edge, c in board.roads.items() if c == color]
     num_roads = len(roads) // 2
-    longest_road = get_longest_road_length(state, color)
-    score += num_roads * 0.1 + longest_road * 0.1
- 
+    score += num_roads * 0.03
+
     subgraphs = board.find_connected_components(color)
     buildable = board.buildable_node_ids(color) if subgraphs else []
     for node_id in buildable:
@@ -130,8 +185,8 @@ def network_position_score(state, color):
         for tile in board.map.adjacent_tiles.get(node_id, []):
             if tile.number:
                 pip_sum += pip_counts.get(tile.number, 0)
-        score += 0.04 * pip_sum
- 
+        score += 0.06 * pip_sum
+
     return score
  
  
@@ -164,8 +219,8 @@ def terminal_reward(game, color):
         (get_victory_points(state, c) for c in state.colors if c != color),
         default=0,
     )
-    vp_margin = 0.5 * (my_vps - opp_vps)
-    return (15.0 if winning_color == color else -15.0) + vp_margin
+    #vp_margin = 0.5 * (my_vps - opp_vps)
+    return (15.0 if winning_color == color else -15.0)
  
  
 # ================================================================
@@ -799,7 +854,7 @@ class SCHRAAgent:
 # ================================================================
 # ENVIRONMENT FACTORY
 # ================================================================
- 
+
 def make_env(enemy=None):
     if enemy is None:
         enemy = WeightedRandomPlayer(Color.RED)
@@ -810,6 +865,77 @@ def make_env(enemy=None):
             "vps_to_win": 15,
         },
     )
+    env = SCHRAWrapper(env)
+    return env
+
+
+# ================================================================
+# LEAGUE TRAINING
+# ================================================================
+
+# Mirrors 185_ppo.py: easy/medium/hard tiers, weights per stage, win-rate
+# thresholds for advancing. Single-process variant — sc-hra trains in one
+# env, so we don't need multiprocessing.Manager for the stage holder.
+OPPONENT_TIERS = [
+    ("easy",   lambda: WeightedRandomPlayer(Color.RED)),
+    ("medium", lambda: AlphaBetaPlayer(Color.RED, depth=1)),
+    ("hard",   lambda: ValueFunctionPlayer(Color.RED)),
+]
+
+STAGE_WEIGHTS = [
+    [0.70, 0.20, 0.10],
+    [0.30, 0.50, 0.20],
+    [0.20, 0.40, 0.40],
+]
+
+STAGE_UP_THRESHOLDS = [0.70, 0.50]
+MIN_TIER_EPISODES = 50
+
+
+class LeagueWrapper(Wrapper):
+    """
+    Swaps the opponent inside CatanatronEnv at each episode reset based on
+    the current league stage stored in a single-element list (works in the
+    single-process sc-hra training loop). Injects ``tier_idx`` into info on
+    episode end so the trainer can track per-tier win rates.
+
+    Wrapper stack: CatanatronEnv → LeagueWrapper → SCHRAWrapper
+    """
+
+    def __init__(self, env, stage_holder):
+        super().__init__(env)
+        self._stage_holder = stage_holder
+        self._tier_idx = 0
+
+    def reset(self, **kwargs):
+        stage = min(self._stage_holder[0], len(STAGE_WEIGHTS) - 1)
+        weights = STAGE_WEIGHTS[stage]
+        self._tier_idx = int(np.random.choice(len(weights), p=weights))
+        new_opp = OPPONENT_TIERS[self._tier_idx][1]()
+
+        from catanatron.gym.envs.catanatron_env import CatanatronEnv as _CatanatronEnv
+        unwrapped: _CatanatronEnv = self.env.unwrapped  # type: ignore[assignment]
+        unwrapped.enemies[0] = new_opp
+        unwrapped.players[1] = new_opp
+
+        return self.env.reset(**kwargs)
+
+    def step(self, action):
+        obs, reward, terminated, truncated, info = self.env.step(action)
+        if terminated or truncated:
+            info["tier_idx"] = self._tier_idx
+        return obs, reward, terminated, truncated, info
+
+
+def make_league_env(stage_holder):
+    env = gymnasium.make(
+        "catanatron/Catanatron-v0",
+        config={
+            "enemies": [WeightedRandomPlayer(Color.RED)],
+            "vps_to_win": 15,
+        },
+    )
+    env = LeagueWrapper(env, stage_holder)
     env = SCHRAWrapper(env)
     return env
  
@@ -839,8 +965,12 @@ def train(
     epsilon_decay_steps=200_000,
     # Resume / checkpointing
     resume_path=None,
-    checkpoint_freq=50_000,
+    checkpoint_freq=1_000_000,
+    device="cpu",
 ):
+    global DEVICE
+    DEVICE = _resolve_device(device)
+    print(f"[device] Using {DEVICE}")
     env = make_env(enemy)
     eval_env = make_env(enemy)
     n_actions = env.action_space.n
@@ -1041,8 +1171,316 @@ def train(
     eval_env.close()
     print(f"Training complete. Final model at {save_path}/final")
     return agent
- 
- 
+
+
+def league_train(
+    total_timesteps=5_000_000,
+    save_path=MODEL_DIR,
+    log_dir="./schra_logs",
+    eval_freq=20_000,
+    eval_episodes=20,
+    # Agent hyperparameters (lr/epsilon are annealed across the full run,
+    # mirroring 185_ppo's linear annealing of learning_rate and ent_coef)
+    lr_critic_start=3e-4,
+    lr_critic_end=1e-5,
+    lr_meta_start=3e-4,
+    lr_meta_end=1e-5,
+    gamma=0.999,
+    buffer_size=200_000,
+    batch_size=256,
+    target_update_freq=2000,
+    train_freq=4,
+    warmup_steps=10_000,
+    epsilon_start=1.0,
+    epsilon_end=0.05,
+    # Resume / checkpointing
+    resume_path=None,
+    checkpoint_freq=1_000_000,
+    start_stage=0,
+    device="cpu",
+):
+    """Opponent-sampling / league training for SC-HRA. Mirrors 185_ppo.league_train:
+    starts vs WeightedRandom and shifts the opponent distribution toward
+    AlphaBeta/ValueFunction as win-rate thresholds are met. Eval uses a fixed
+    WeightedRandom opponent so the curve stays comparable across stages."""
+
+    global DEVICE
+    DEVICE = _resolve_device(device)
+    print(f"[device] Using {DEVICE}")
+
+    stage_holder = [start_stage]
+    env = make_league_env(stage_holder)
+    eval_env = make_env(WeightedRandomPlayer(Color.RED))
+    n_actions = env.action_space.n
+
+    agent = SCHRAAgent(
+        n_actions=n_actions,
+        lr_critic=lr_critic_start,
+        lr_meta=lr_meta_start,
+        gamma=gamma,
+        buffer_size=buffer_size,
+        batch_size=batch_size,
+        target_update_freq=target_update_freq,
+        train_freq=train_freq,
+        warmup_steps=warmup_steps,
+        epsilon_start=epsilon_start,
+        epsilon_end=epsilon_end,
+        epsilon_decay_steps=total_timesteps,
+    )
+
+    # SB3 logger: prints the same key/value table format 185_ppo gets from
+    # MaskablePPO(verbose=1) and also writes TensorBoard scalars.
+    # Auto-increment a per-run subdirectory under log_dir so successive runs
+    # don't dump events into the same folder (mirrors what SB3's
+    # tensorboard_log + tb_log_name does for MaskablePPO in 185_ppo).
+    os.makedirs(log_dir, exist_ok=True)
+    existing = [d for d in os.listdir(log_dir) if d.startswith("SCHRA_")]
+    next_id = 1 + max(
+        (int(d.split("_", 1)[1]) for d in existing if d.split("_", 1)[1].isdigit()),
+        default=0,
+    )
+    run_dir = os.path.join(log_dir, f"SCHRA_{next_id}")
+    sb3_logger = configure_sb3_logger(run_dir, ["stdout", "tensorboard"])
+    print(f"[tensorboard] writing events to {run_dir}")
+
+    recent_wins = deque(maxlen=100)
+    tier_wins = [deque(maxlen=200) for _ in range(len(OPPONENT_TIERS))]
+    recent_ep_rewards = deque(maxlen=100)
+    recent_ep_lengths = deque(maxlen=100)
+    recent_r_resource = deque(maxlen=100)
+    recent_r_position = deque(maxlen=100)
+    recent_r_vp = deque(maxlen=100)
+    recent_r_terminal = deque(maxlen=100)
+
+    obs, info = env.reset()
+    episode_channel_rewards = np.zeros(N_CHANNELS)
+    episode_steps = 0
+    episode_count = 0
+    best_win_rate = 0.0
+    start_step = 0
+
+    if resume_path is not None:
+        extra = agent.load_checkpoint(resume_path)
+        start_step = agent.total_steps
+        episode_count = extra.get("episode_count", 0)
+        best_win_rate = extra.get("best_win_rate", 0.0)
+        for x in extra.get("recent_wins", []):
+            recent_wins.append(x)
+        for x in extra.get("recent_ep_rewards", []):
+            recent_ep_rewards.append(x)
+        for x in extra.get("recent_ep_lengths", []):
+            recent_ep_lengths.append(x)
+        for tier_i, ws in enumerate(extra.get("tier_wins", [[] for _ in OPPONENT_TIERS])):
+            for x in ws:
+                tier_wins[tier_i].append(x)
+        stage_holder[0] = extra.get("league_stage", start_stage)
+        agent.episode_buffer.clear()
+        obs, info = env.reset()
+        episode_channel_rewards = np.zeros(N_CHANNELS)
+        episode_steps = 0
+        print(
+            f"[resume] Resuming from step {start_step}/{total_timesteps} "
+            f"(episode {episode_count}, stage {stage_holder[0]}, best_wr={best_win_rate:.1%})"
+        )
+
+    def _apply_anneal(step):
+        progress = min(1.0, step / max(1, total_timesteps))
+        lr_c = lr_critic_start + (lr_critic_end - lr_critic_start) * progress
+        lr_m = lr_meta_start + (lr_meta_end - lr_meta_start) * progress
+        for opt in agent.critic_optimizers:
+            for pg in opt.param_groups:
+                pg["lr"] = lr_c
+        for pg in agent.meta_optimizer.param_groups:
+            pg["lr"] = lr_m
+        return lr_c, lr_m
+
+    def _trainer_extra():
+        return {
+            "episode_count": episode_count,
+            "best_win_rate": best_win_rate,
+            "recent_wins": list(recent_wins),
+            "recent_ep_rewards": list(recent_ep_rewards),
+            "recent_ep_lengths": list(recent_ep_lengths),
+            "tier_wins": [list(w) for w in tier_wins],
+            "league_stage": stage_holder[0],
+        }
+
+    if start_step >= total_timesteps:
+        print(
+            f"[resume] total_steps ({start_step}) already >= total_timesteps "
+            f"({total_timesteps}); nothing to do."
+        )
+        env.close()
+        eval_env.close()
+        return agent
+
+    # Match SB3 MaskablePPO league_train cadence: dump table every n_steps*n_envs
+    # = 8192*4 = 32768 env steps so output volume is similar to 185_ppo.
+    DUMP_INTERVAL = 32768
+    last_dump_step = start_step
+    iterations = 0
+    last_critic_losses: dict = {}
+    last_meta_loss = None
+    lr_c, lr_m = lr_critic_start, lr_meta_start
+    start_time = time.time()
+
+    # tqdm.rich is what SB3's progress_bar=True uses; fall back to plain tqdm
+    # if rich isn't installed.
+    try:
+        from tqdm.rich import tqdm as _tqdm
+    except ImportError:
+        from tqdm import tqdm as _tqdm
+    pbar = _tqdm(total=total_timesteps, initial=start_step)
+
+    for step in range(start_step, total_timesteps):
+        pbar.update(1)
+
+        valid_actions = env.get_valid_actions()
+        if not valid_actions:
+            valid_actions = [0]
+
+        action_mask = np.zeros(n_actions, dtype=bool)
+        action_mask[valid_actions] = True
+
+        action = agent.select_action(obs, valid_actions)
+
+        next_obs, _, terminated, truncated, info = env.step(action)
+        done = terminated or truncated
+        rewards = info["rewards"]
+
+        next_valid = env.get_valid_actions()
+        if not next_valid:
+            next_valid = [0]
+        next_action_mask = np.zeros(n_actions, dtype=bool)
+        next_action_mask[next_valid] = True
+
+        agent.store_transition(
+            obs, action, rewards, next_obs, done,
+            action_mask, next_action_mask,
+        )
+
+        episode_channel_rewards += rewards
+        episode_steps += 1
+
+        lr_c, lr_m = _apply_anneal(step)
+
+        critic_losses = agent.train_critics()
+        if critic_losses:
+            last_critic_losses = critic_losses
+
+        if done:
+            r_terminal = info["r_terminal"]
+            meta_loss = agent.train_meta(r_terminal)
+            if meta_loss is not None:
+                last_meta_loss = meta_loss
+
+            won = info.get("win", 0)
+            tier_idx = info.get("tier_idx", 0)
+            recent_wins.append(won)
+            tier_wins[tier_idx].append(won)
+            ep_total = float(episode_channel_rewards.sum()) + r_terminal
+            recent_ep_rewards.append(ep_total)
+            recent_ep_lengths.append(episode_steps)
+            recent_r_resource.append(float(episode_channel_rewards[0]))
+            recent_r_position.append(float(episode_channel_rewards[1]))
+            recent_r_vp.append(float(episode_channel_rewards[2]))
+            recent_r_terminal.append(float(r_terminal))
+            episode_count += 1
+
+            # Stage advancement: check primary tier for current stage
+            stage = stage_holder[0]
+            if stage < len(STAGE_UP_THRESHOLDS):
+                wins = tier_wins[stage]
+                if len(wins) >= MIN_TIER_EPISODES:
+                    rate = float(np.mean(list(wins)[-100:]))
+                    threshold = STAGE_UP_THRESHOLDS[stage]
+                    if rate >= threshold:
+                        stage_holder[0] = stage + 1
+                        tier_name = OPPONENT_TIERS[stage][0]
+                        print(
+                            f"\n[League] Stage {stage} → {stage + 1}  "
+                            f"({tier_name} win rate: {rate:.1%} ≥ {threshold:.0%})"
+                        )
+
+            obs, info = env.reset()
+            episode_channel_rewards = np.zeros(N_CHANNELS)
+            episode_steps = 0
+        else:
+            obs = next_obs
+
+        # Periodic table dump (mirrors SB3's per-rollout table output)
+        if (step + 1) - last_dump_step >= DUMP_INTERVAL:
+            iterations += 1
+            elapsed = max(1e-9, time.time() - start_time)
+
+            if recent_ep_rewards:
+                sb3_logger.record("rollout/ep_rew_mean", float(np.mean(recent_ep_rewards)))
+                sb3_logger.record("rollout/ep_len_mean", float(np.mean(recent_ep_lengths)))
+            if recent_wins:
+                sb3_logger.record("rollout/win_rate", float(np.mean(recent_wins)))
+            if recent_r_resource:
+                sb3_logger.record("channel/resource", float(np.mean(recent_r_resource)))
+                sb3_logger.record("channel/position", float(np.mean(recent_r_position)))
+                sb3_logger.record("channel/vp", float(np.mean(recent_r_vp)))
+                sb3_logger.record("channel/terminal", float(np.mean(recent_r_terminal)))
+
+            sb3_logger.record("league/stage", float(stage_holder[0]))
+            for i, (name, _) in enumerate(OPPONENT_TIERS):
+                if tier_wins[i]:
+                    sb3_logger.record(
+                        f"league/win_rate_{name}",
+                        float(np.mean(list(tier_wins[i])[-100:])),
+                    )
+
+            sb3_logger.record("train/epsilon", float(agent._epsilon()))
+            sb3_logger.record("train/lr_critic", float(lr_c))
+            sb3_logger.record("train/lr_meta", float(lr_m))
+            if last_meta_loss is not None:
+                sb3_logger.record("train/meta_loss", float(last_meta_loss))
+            for name, val in last_critic_losses.items():
+                sb3_logger.record(f"train/{name}_loss", float(val))
+
+            omega = agent.get_omega(obs)
+            sb3_logger.record("omega/resource", float(omega[0]))
+            sb3_logger.record("omega/position", float(omega[1]))
+            sb3_logger.record("omega/vp", float(omega[2]))
+
+            sb3_logger.record("time/fps", int((step + 1 - start_step) / elapsed))
+            sb3_logger.record("time/iterations", iterations)
+            sb3_logger.record("time/time_elapsed", int(elapsed))
+            sb3_logger.record("time/total_timesteps", step + 1)
+
+            sb3_logger.dump(step=step + 1)
+            last_dump_step = step + 1
+
+        # Periodic full-state checkpoint + best-update (consolidated to one
+        # cadence so we only print the save lines once per checkpoint_freq).
+        if checkpoint_freq > 0 and (step + 1) % checkpoint_freq == 0:
+            agent.save_checkpoint(
+                os.path.join(save_path, "checkpoint_league"), extra=_trainer_extra()
+            )
+            if len(recent_wins) >= 20:
+                win_rate = float(np.mean(recent_wins))
+                if win_rate > best_win_rate:
+                    best_win_rate = win_rate
+                    agent.save_checkpoint(
+                        os.path.join(save_path, "best_league"), extra=_trainer_extra()
+                    )
+
+    pbar.refresh()
+    pbar.close()
+    agent.save(os.path.join(save_path, "league_final"))
+    agent.save_checkpoint(
+        os.path.join(save_path, "checkpoint_league"), extra=_trainer_extra()
+    )
+    sb3_logger.close()
+    env.close()
+    eval_env.close()
+    print(f"Model saved to {save_path}/league_final")
+    print(f"TensorBoard logs at {log_dir} — run: tensorboard --logdir {log_dir}")
+    return agent
+
+
 # ================================================================
 # EVALUATION
 # ================================================================
@@ -1186,20 +1624,47 @@ if __name__ == "__main__":
              "resume training from with no dropoff.",
     )
     parser.add_argument(
-        "--checkpoint-freq", type=int, default=50_000,
+        "--checkpoint-freq", type=int, default=1_000_000,
         help="Save a full training checkpoint every N env steps (0 to disable).",
     )
- 
+    parser.add_argument(
+        "--league", action="store_true",
+        help="Train with opponent sampling / league training (mirrors 185_ppo).",
+    )
+    parser.add_argument(
+        "--league-continue", type=str, default=None,
+        help="Path to a checkpoint directory to resume league training from.",
+    )
+    parser.add_argument(
+        "--start-stage", type=int, default=0,
+        help="League stage to start/resume from (0=easy, 1=medium, 2=hard).",
+    )
+    parser.add_argument(
+        "--device", type=str, default="cpu",
+        help="Compute device: cpu, gpu (auto-pick cuda/mps), mps (Mac GPU), cuda, or auto.",
+    )
+
     args = parser.parse_args()
- 
+
     enemy_map = {
         "random": WeightedRandomPlayer(Color.RED),
         "value": ValueFunctionPlayer(Color.RED),
         "alphabeta": AlphaBetaPlayer(Color.RED, depth=1),
     }
     enemy = enemy_map[args.enemy]
- 
-    if args.mode == "train":
+
+    if args.league or args.league_continue:
+        league_train(
+            total_timesteps=args.timesteps,
+            save_path=args.save_path,
+            log_dir=args.log_dir,
+            warmup_steps=args.warmup,
+            resume_path=args.league_continue,
+            checkpoint_freq=args.checkpoint_freq,
+            start_stage=args.start_stage,
+            device=args.device,
+        )
+    elif args.mode == "train":
         train(
             total_timesteps=args.timesteps,
             save_path=args.save_path,
@@ -1212,6 +1677,7 @@ if __name__ == "__main__":
             warmup_steps=args.warmup,
             resume_path=args.resume,
             checkpoint_freq=args.checkpoint_freq,
+            device=args.device,
         )
     elif args.mode == "eval":
         agent = SCHRAAgent(n_actions=290)

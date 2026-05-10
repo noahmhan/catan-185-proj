@@ -50,9 +50,8 @@ from catanatron_experimental.machine_learning.players.initial_placement_ppo impo
 # ---------------------------------------------------------------------------
 # Paths to trained artefacts
 # ---------------------------------------------------------------------------
-
-BEST_MODEL = os.path.join(ROOT, "best_ppo", "league_model.zip")
-BEST_NORM = os.path.join(ROOT, "best_ppo", "vecnormalize.pkl")
+BEST_MODEL = os.path.join(ROOT, "continued_league", "league_model.zip")
+BEST_NORM = os.path.join(ROOT, "continued_league", "vecnormalize.pkl")
 
 LEAGUE_MODEL  = os.path.join(ROOT, "ppo_league", "league_model.zip")
 BEST_LEAGUE   = os.path.join(ROOT, "ppo_league", "best_league", "best_model.zip")

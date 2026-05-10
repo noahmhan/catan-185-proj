@@ -836,7 +836,7 @@ STAGE_WEIGHTS = [
 # Win-rate threshold (over a rolling window) to advance from each stage.
 # Index matches the stage number; we check win rate against the *primary*
 # tier for that stage (tier 0 for stage 0, tier 1 for stage 1).
-STAGE_UP_THRESHOLDS = [0.80, 0.50]
+STAGE_UP_THRESHOLDS = [0.70, 0.50]
 MIN_TIER_EPISODES = 50   # minimum same-tier episodes before checking
 
 
