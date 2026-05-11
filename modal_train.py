@@ -80,6 +80,19 @@ image = (
     )
 )
 
+# Slim image for the TensorBoard web server: just needs `tensorboard` + access
+# to the volume. Keeping it separate from the training image means
+# `modal serve modal_train.py` does NOT trigger a rebuild every time a
+# project file changes (the training image's `add_local_dir` layer hash
+# flips on any edit and cascades into the two `pip install -e` commands).
+tensorboard_image = (
+    modal.Image.debian_slim(python_version="3.12")
+    # `setuptools` provides `pkg_resources`, which `tensorboard.default`
+    # still imports at startup. Python 3.12's slim base image no longer
+    # ships setuptools by default, so we install it explicitly.
+    .pip_install("tensorboard", "setuptools")
+)
+
 volume = modal.Volume.from_name(VOLUME_NAME, create_if_missing=True)
 
 app = modal.App(APP_NAME, image=image)
@@ -163,11 +176,12 @@ def run_league(
 
 
 @app.function(
+    image=tensorboard_image,
     volumes={"/data": volume},
     timeout=4 * 60 * 60,  # idle timeout; refresh if you need longer sessions
     max_containers=1,
 )
-@modal.web_server(port=6006, startup_timeout=60)
+@modal.web_server(port=6006, startup_timeout=180)
 def tensorboard():
     """Serve TensorBoard at a public Modal URL backed by /data/logs.
 
@@ -175,7 +189,13 @@ def tensorboard():
     """
     import subprocess
 
-    subprocess.Popen(
+    # Blocking + check=True so any tensorboard startup error (missing dep,
+    # bad logdir, etc.) propagates as a function failure to Modal's logs
+    # instead of being swallowed by Popen's fire-and-forget. Without this,
+    # a crashed tensorboard just leaves the container running with port
+    # 6006 unbound, modal hits startup_timeout, terminates the container,
+    # and `modal serve` auto-restarts in a loop.
+    subprocess.run(
         [
             "tensorboard",
             "--logdir",
@@ -183,7 +203,8 @@ def tensorboard():
             "--bind_all",
             "--port",
             "6006",
-        ]
+        ],
+        check=True,
     )
 
 

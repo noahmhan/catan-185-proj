@@ -511,41 +511,81 @@ class AnnealingCallback(BaseCallback):
     --league-continue call can read them as starting values.
     """
 
-    def __init__(self, start_lr, end_lr, start_ent, end_ent, total_new_steps, state_file, verbose=0):
+    def __init__(self, start_lr, end_lr, start_ent, end_ent, total_new_steps, state_file,
+                 ent_decay_steps=None, ent_schedule=None, verbose=0):
         super().__init__(verbose)
         self.start_lr = start_lr
         self.end_lr = end_lr
         self.start_ent = start_ent
         self.end_ent = end_ent
         self.total_new_steps = total_new_steps
+        # Entropy decays over its own horizon (decoupled from LR's). After
+        # ent_decay_steps the coefficient stays clamped at end_ent. Falls
+        # back to total_new_steps so existing callers keep working.
+        self.ent_decay_steps = ent_decay_steps if ent_decay_steps is not None else total_new_steps
+        # Optional N-waypoint entropy schedule. List of (step, value) sorted
+        # ascending by step; step is ABSOLUTE env-step count (model.num_timesteps),
+        # so the schedule shape is preserved across --league-continue runs.
+        # Takes precedence over the linear start_ent → end_ent decay above.
+        self.ent_schedule = ent_schedule
         self.state_file = state_file
         self._step_offset = 0
 
     def _on_training_start(self):
         # num_timesteps == loaded checkpoint steps (0 for fresh runs)
         self._step_offset = self.num_timesteps
-        self._apply(0.0)
+        self._apply(0)
 
-    def _apply(self, t: float):
-        lr = self.start_lr + (self.end_lr - self.start_lr) * t
-        ent = self.start_ent + (self.end_ent - self.start_ent) * t
+    def _apply(self, steps_into_run: int):
+        # LR uses run-relative timing so JSON-state resume gives a flat
+        # continuation after a completed schedule.
+        t_lr = min(1.0, steps_into_run / max(1, self.total_new_steps))
+        lr = self.start_lr + (self.end_lr - self.start_lr) * t_lr
+
+        # Entropy uses absolute timing when a waypoint schedule is provided
+        # so multi-phase shapes survive intact across resumed runs.
+        if self.ent_schedule:
+            ent = self._interp_schedule(self.num_timesteps, self.ent_schedule)
+        else:
+            t_ent = min(1.0, steps_into_run / max(1, self.ent_decay_steps))
+            ent = self.start_ent + (self.end_ent - self.start_ent) * t_ent
+
         for param_group in self.model.policy.optimizer.param_groups:
             param_group["lr"] = lr
         self.model.ent_coef = ent
         self.logger.record("train/lr", lr)
         self.logger.record("train/ent_coef", ent)
 
+    @staticmethod
+    def _interp_schedule(step, schedule):
+        """Linear interpolation between (step, value) waypoints, clamped
+        at the first/last value outside the schedule range."""
+        if step <= schedule[0][0]:
+            return schedule[0][1]
+        if step >= schedule[-1][0]:
+            return schedule[-1][1]
+        for i in range(len(schedule) - 1):
+            s0, v0 = schedule[i]
+            s1, v1 = schedule[i + 1]
+            if step <= s1:
+                t = (step - s0) / max(1, s1 - s0)
+                return v0 + (v1 - v0) * t
+        return schedule[-1][1]
+
     def _on_step(self) -> bool:
         steps_into_run = self.num_timesteps - self._step_offset
-        t = min(1.0, steps_into_run / max(1, self.total_new_steps))
-        self._apply(t)
+        self._apply(steps_into_run)
         return True
 
     def _on_training_end(self):
         steps_into_run = self.num_timesteps - self._step_offset
-        t = min(1.0, steps_into_run / max(1, self.total_new_steps))
-        lr = self.start_lr + (self.end_lr - self.start_lr) * t
-        ent = self.start_ent + (self.end_ent - self.start_ent) * t
+        t_lr = min(1.0, steps_into_run / max(1, self.total_new_steps))
+        lr = self.start_lr + (self.end_lr - self.start_lr) * t_lr
+        if self.ent_schedule:
+            ent = self._interp_schedule(self.num_timesteps, self.ent_schedule)
+        else:
+            t_ent = min(1.0, steps_into_run / max(1, self.ent_decay_steps))
+            ent = self.start_ent + (self.end_ent - self.start_ent) * t_ent
         os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
         with open(self.state_file, "w") as f:
             json.dump({"lr": lr, "ent_coef": ent}, f)
@@ -997,7 +1037,10 @@ def league_train(
 
         # Load saved schedule values so --league-continue resumes from where
         # the previous run ended instead of jumping back to initial values.
-        start_lr, start_ent = 3e-4, 0.02
+        # Fresh-run defaults: lr 3e-4 (PPO standard); ent 0.5 (aggressive
+        # early exploration, decayed to 0.05 within 5M steps — see
+        # AnnealingCallback below).
+        start_lr, start_ent = 3e-4, 0.5
         if load_path and os.path.exists(LEAGUE_SCHEDULE_STATE):
             with open(LEAGUE_SCHEDULE_STATE) as f:
                 state = json.load(f)
@@ -1028,12 +1071,31 @@ def league_train(
                 policy_kwargs={"net_arch": dict(pi=[512, 256], vf=[512, 256])},
             )
 
+        # Four-phase entropy schedule, expressed in ABSOLUTE env-step
+        # waypoints so the shape survives across --league-continue runs:
+        #   0          → 0.5     (start, very exploratory)
+        #   5M         → 0.05    (end of fast initial decay; matches sc-hra)
+        #   20M        → 0.01    (end of continued decay)
+        #   max(...)   → 0.005   (slow tail end; clamped past last waypoint)
+        # The tail's end-step adapts to total run length: for a fresh run
+        # of 100M it ends at 100M; for a --league-continue that pushes
+        # training past 100M it extends to that new absolute end so we
+        # don't sit at the floor for the whole resume.
+        abs_end = model.num_timesteps + total_timesteps
+        ent_schedule = [
+            (0, 0.5),
+            (5_000_000, 0.05),
+            (20_000_000, 0.01),
+            (max(20_000_001, abs_end), 0.005),
+        ]
+
         annealing_cb = AnnealingCallback(
             start_lr=start_lr,
             end_lr=1e-4,
             start_ent=start_ent,
-            end_ent=0.003,
+            end_ent=0.005,
             total_new_steps=total_timesteps,
+            ent_schedule=ent_schedule,
             state_file=LEAGUE_SCHEDULE_STATE,
         )
 

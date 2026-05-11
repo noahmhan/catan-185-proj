@@ -314,6 +314,10 @@ class MetaWeightNetwork(nn.Module):
 # REPLAY BUFFER
 # ================================================================
  
+# Transition is kept around as a documentation aid (field names + dtypes)
+# and for back-compat in load_checkpoint when reading older deque-of-tuple
+# replay buffers. The vectorized ReplayBuffer below does not use it on the
+# hot path.
 Transition = namedtuple("Transition", [
     "state",            # np.array (FEATURE_DIM,)
     "action",           # int
@@ -323,28 +327,115 @@ Transition = namedtuple("Transition", [
     "action_mask",      # np.array (n_actions,) bool
     "next_action_mask", # np.array (n_actions,) bool
 ])
- 
- 
+
+
 class ReplayBuffer:
-    def __init__(self, capacity):
-        self.buffer = deque(maxlen=capacity)
- 
-    def push(self, *args):
-        self.buffer.append(Transition(*args))
- 
+    """Vectorized circular replay buffer.
+
+    Stores each Transition field as a preallocated numpy array of shape
+    (capacity, ...). push() writes at a rolling index; sample() does a
+    single np.random.randint to pick row indices and fancy-indexes all
+    fields in one shot, eliminating the per-sample Python iteration that
+    dominated the old deque-of-namedtuples implementation.
+    """
+
+    def __init__(self, capacity, state_dim, n_actions, n_channels):
+        self.capacity = int(capacity)
+        self.state_dim = int(state_dim)
+        self.n_actions = int(n_actions)
+        self.n_channels = int(n_channels)
+
+        self.states = np.zeros((self.capacity, self.state_dim), dtype=np.float32)
+        self.actions = np.zeros(self.capacity, dtype=np.int64)
+        self.rewards = np.zeros((self.capacity, self.n_channels), dtype=np.float32)
+        self.next_states = np.zeros((self.capacity, self.state_dim), dtype=np.float32)
+        self.dones = np.zeros(self.capacity, dtype=np.float32)
+        self.action_masks = np.zeros((self.capacity, self.n_actions), dtype=bool)
+        self.next_action_masks = np.zeros((self.capacity, self.n_actions), dtype=bool)
+
+        self.idx = 0   # next write position
+        self.size = 0  # number of valid entries (<= capacity)
+
+    def push(self, state, action, rewards, next_state, done,
+             action_mask, next_action_mask):
+        i = self.idx
+        self.states[i] = state
+        self.actions[i] = action
+        self.rewards[i] = rewards
+        self.next_states[i] = next_state
+        self.dones[i] = float(done)
+        self.action_masks[i] = action_mask
+        self.next_action_masks[i] = next_action_mask
+        self.idx = (self.idx + 1) % self.capacity
+        if self.size < self.capacity:
+            self.size += 1
+
     def sample(self, batch_size):
-        batch = random.sample(self.buffer, batch_size)
-        states = torch.FloatTensor(np.array([t.state for t in batch])).to(DEVICE)
-        actions = torch.LongTensor([t.action for t in batch]).to(DEVICE)
-        rewards = torch.FloatTensor(np.array([t.rewards for t in batch])).to(DEVICE)
-        next_states = torch.FloatTensor(np.array([t.next_state for t in batch])).to(DEVICE)
-        dones = torch.FloatTensor([float(t.done) for t in batch]).to(DEVICE)
-        action_masks = torch.BoolTensor(np.array([t.action_mask for t in batch])).to(DEVICE)
-        next_action_masks = torch.BoolTensor(np.array([t.next_action_mask for t in batch])).to(DEVICE)
-        return states, actions, rewards, next_states, dones, action_masks, next_action_masks
- 
+        # Sampling WITH replacement: O(batch_size). For buffer_size=200k and
+        # batch_size=256 the chance of a collision is ~16%, which is well
+        # within the noise of DQN updates — most DQN reference impls do
+        # uniform-with-replacement for exactly this reason.
+        idx = np.random.randint(0, self.size, size=batch_size)
+        return (
+            torch.from_numpy(self.states[idx]).to(DEVICE),
+            torch.from_numpy(self.actions[idx]).to(DEVICE),
+            torch.from_numpy(self.rewards[idx]).to(DEVICE),
+            torch.from_numpy(self.next_states[idx]).to(DEVICE),
+            torch.from_numpy(self.dones[idx]).to(DEVICE),
+            torch.from_numpy(self.action_masks[idx]).to(DEVICE),
+            torch.from_numpy(self.next_action_masks[idx]).to(DEVICE),
+        )
+
     def __len__(self):
-        return len(self.buffer)
+        return self.size
+
+    # --- Checkpoint helpers -----------------------------------------------
+
+    def to_state_dict(self):
+        """Snapshot the buffer as a dict of numpy arrays for torch.save().
+        Trims to actual size so we don't dump zeros for unfilled rows."""
+        n = self.size
+        return {
+            "capacity": self.capacity,
+            "state_dim": self.state_dim,
+            "n_actions": self.n_actions,
+            "n_channels": self.n_channels,
+            "size": n,
+            "idx": self.idx,
+            "states": self.states[:n].copy(),
+            "actions": self.actions[:n].copy(),
+            "rewards": self.rewards[:n].copy(),
+            "next_states": self.next_states[:n].copy(),
+            "dones": self.dones[:n].copy(),
+            "action_masks": self.action_masks[:n].copy(),
+            "next_action_masks": self.next_action_masks[:n].copy(),
+        }
+
+    def load_state_dict(self, sd):
+        """Inverse of to_state_dict(). Tolerates a smaller saved capacity
+        by copying into the head of the new buffer."""
+        n = int(sd["size"])
+        n = min(n, self.capacity)
+        self.states[:n] = sd["states"][:n]
+        self.actions[:n] = sd["actions"][:n]
+        self.rewards[:n] = sd["rewards"][:n]
+        self.next_states[:n] = sd["next_states"][:n]
+        self.dones[:n] = sd["dones"][:n]
+        self.action_masks[:n] = sd["action_masks"][:n]
+        self.next_action_masks[:n] = sd["next_action_masks"][:n]
+        self.size = n
+        # New writes go at the next slot after the loaded data; if the
+        # buffer is full again we overwrite from the start, which is
+        # equivalent to the original circular behavior.
+        self.idx = n % self.capacity
+
+    def load_from_tuples(self, tuples):
+        """Legacy load path: list of (state, action, rewards, next_state,
+        done, action_mask, next_action_mask) tuples (or Transitions).
+        Used when reading a checkpoint written before the buffer was
+        vectorized."""
+        for t in tuples:
+            self.push(*t)
  
  
 # ================================================================
@@ -517,6 +608,9 @@ class SCHRAAgent:
         epsilon_start=1.0,
         epsilon_end=0.05,
         epsilon_decay_steps=200_000,
+        epsilon_mid=None,
+        epsilon_decay_steps_total=None,
+        epsilon_schedule=None,
     ):
         self.n_actions = n_actions
         self.gamma = gamma
@@ -527,6 +621,22 @@ class SCHRAAgent:
         self.epsilon_start = epsilon_start
         self.epsilon_end = epsilon_end
         self.epsilon_decay_steps = epsilon_decay_steps
+        # Optional second-phase decay (two-phase kink schedule). If
+        # epsilon_mid and epsilon_decay_steps_total are both set, the
+        # schedule is piecewise linear:
+        #   phase 1: epsilon_start  → epsilon_mid  over [0, epsilon_decay_steps]
+        #   phase 2: epsilon_mid    → epsilon_end  over [epsilon_decay_steps, epsilon_decay_steps_total]
+        # Otherwise falls back to single-phase epsilon_start → epsilon_end
+        # over epsilon_decay_steps.
+        self.epsilon_mid = epsilon_mid
+        self.epsilon_decay_steps_total = epsilon_decay_steps_total
+        # Optional N-waypoint schedule. If set (list of (step, value)
+        # tuples sorted by step), takes precedence over the two-phase and
+        # single-phase paths above. Linear interpolation between waypoints;
+        # outside the range, clamps to the first/last value. Use this to
+        # express schedules with more than one kink (e.g., fast initial
+        # decay → moderate decay → long slow tail).
+        self.epsilon_schedule = epsilon_schedule
  
         # Critics (one per channel)
         self.critics = [
@@ -553,8 +663,13 @@ class SCHRAAgent:
         # Q-value normalizers (one per channel)
         self.q_normalizers = [RunningNormalizer() for _ in range(N_CHANNELS)]
  
-        # Replay buffer
-        self.replay_buffer = ReplayBuffer(buffer_size)
+        # Replay buffer (preallocated numpy arrays — see ReplayBuffer above)
+        self.replay_buffer = ReplayBuffer(
+            buffer_size,
+            state_dim=state_dim,
+            n_actions=n_actions,
+            n_channels=N_CHANNELS,
+        )
  
         # Episode buffer for meta-network training (single-env path)
         # Each entry: (state_tensor, q_values_tensor[3])
@@ -569,9 +684,51 @@ class SCHRAAgent:
         self.total_steps = 0
  
     def _epsilon(self):
-        """Linear epsilon decay."""
-        progress = min(1.0, self.total_steps / self.epsilon_decay_steps)
-        return self.epsilon_start + (self.epsilon_end - self.epsilon_start) * progress
+        """Epsilon schedule.
+
+        Priority:
+          1. N-waypoint piecewise linear if epsilon_schedule is set.
+          2. Two-phase kink if epsilon_mid + epsilon_decay_steps_total set.
+          3. Single linear epsilon_start → epsilon_end over epsilon_decay_steps.
+        """
+        if self.epsilon_schedule:
+            return self._interp_epsilon_schedule()
+
+        if self.epsilon_mid is None or self.epsilon_decay_steps_total is None:
+            progress = min(1.0, self.total_steps / max(1, self.epsilon_decay_steps))
+            return self.epsilon_start + (self.epsilon_end - self.epsilon_start) * progress
+
+        # Phase 1: start → mid over [0, epsilon_decay_steps]
+        if self.total_steps <= self.epsilon_decay_steps:
+            t = self.total_steps / max(1, self.epsilon_decay_steps)
+            return self.epsilon_start + (self.epsilon_mid - self.epsilon_start) * t
+
+        # Phase 2: mid → end over [epsilon_decay_steps, epsilon_decay_steps_total]
+        phase2_span = max(1, self.epsilon_decay_steps_total - self.epsilon_decay_steps)
+        t = min(1.0, (self.total_steps - self.epsilon_decay_steps) / phase2_span)
+        return self.epsilon_mid + (self.epsilon_end - self.epsilon_mid) * t
+
+    def _interp_epsilon_schedule(self):
+        """Linearly interpolate self.epsilon_schedule at self.total_steps.
+
+        Schedule is a list of (step, value) tuples sorted ascending by step.
+        Below the first step: clamps to first value. Above the last step:
+        clamps to last value. Between two consecutive waypoints, linearly
+        interpolates.
+        """
+        sched = self.epsilon_schedule
+        step = self.total_steps
+        if step <= sched[0][0]:
+            return sched[0][1]
+        if step >= sched[-1][0]:
+            return sched[-1][1]
+        for i in range(len(sched) - 1):
+            s0, v0 = sched[i]
+            s1, v1 = sched[i + 1]
+            if step <= s1:
+                t = (step - s0) / max(1, s1 - s0)
+                return v0 + (v1 - v0) * t
+        return sched[-1][1]
  
     def select_action(self, state, valid_actions):
         """Epsilon-greedy over Q_final = Σ ω_i · Q_i, masked to legal actions.
@@ -881,13 +1038,11 @@ class SCHRAAgent:
             # Optimizer states
             "critic_optimizers": [opt.state_dict() for opt in self.critic_optimizers],
             "meta_optimizer": self.meta_optimizer.state_dict(),
-            # Replay buffer: serialized as plain tuples (NOT the Transition
-            # namedtuple). Pickling the namedtuple requires sys.modules to have
-            # the defining module ("schra" when sc-hra.py is loaded by Modal
-            # via importlib), and registering it there breaks SubprocVecEnv
-            # workers (they can't `import schra`). Plain tuples have no module
-            # reference, so they pickle/unpickle anywhere.
-            "replay_buffer": [tuple(t) for t in self.replay_buffer.buffer],
+            # Replay buffer: dict of numpy arrays. No module-bound types
+            # (Transition namedtuple etc.) appear in the pickle, so it
+            # survives the schra-loaded-via-importlib name issue that
+            # broke older saves on Modal.
+            "replay_buffer": self.replay_buffer.to_state_dict(),
             "q_normalizers": [
                 {"mean": n.mean, "var": n.var, "count": n.count}
                 for n in self.q_normalizers
@@ -942,14 +1097,15 @@ class SCHRAAgent:
             self.critic_optimizers[i].load_state_dict(sd)
         self.meta_optimizer.load_state_dict(ckpt["meta_optimizer"])
 
-        # Replay buffer: rehydrate plain-tuple form back into Transitions.
-        # Tolerate the legacy on-disk form too (deque of namedtuples) for any
-        # checkpoint written before this change.
+        # Replay buffer. Two on-disk shapes:
+        #   - dict (new): snapshot of numpy arrays from to_state_dict().
+        #   - list (legacy): list of plain tuples (or Transitions) from
+        #     pre-vectorized saves; replayed via push().
         loaded_buf = ckpt["replay_buffer"]
-        rehydrated = deque(maxlen=self.replay_buffer.buffer.maxlen)
-        for t in loaded_buf:
-            rehydrated.append(t if isinstance(t, Transition) else Transition(*t))
-        self.replay_buffer.buffer = rehydrated
+        if isinstance(loaded_buf, dict):
+            self.replay_buffer.load_state_dict(loaded_buf)
+        else:
+            self.replay_buffer.load_from_tuples(loaded_buf)
         for i, n in enumerate(ckpt["q_normalizers"]):
             self.q_normalizers[i].mean = n["mean"]
             self.q_normalizers[i].var = n["var"]
@@ -1320,10 +1476,13 @@ def league_train(
     log_dir="./schra_logs",
     eval_freq=20_000,
     eval_episodes=20,
-    # Agent hyperparameters (lr/epsilon are annealed across the full run,
-    # mirroring 185_ppo's linear annealing of learning_rate and ent_coef).
-    # lr floors raised 10x (1e-5 → 1e-4) so the agent keeps moving in late
-    # training instead of crawling along a dead-low LR floor.
+    # Agent hyperparameters. lr is annealed linearly across the full run
+    # (3e-4 → 1e-4), matching 185_ppo's AnnealingCallback. Epsilon is NOT
+    # tied to total_timesteps — PPO's policy goes greedy well before
+    # total_timesteps (entropy is a soft regularizer, not a randomness gate),
+    # so we match that effective profile by decaying ε over a small fraction
+    # of the run (epsilon_decay_frac below) and letting the agent exploit
+    # the rest of the way.
     lr_critic_start=3e-4,
     lr_critic_end=1e-4,
     lr_meta_start=3e-4,
@@ -1334,8 +1493,13 @@ def league_train(
     target_update_freq=2000,
     train_freq=4,
     warmup_steps=10_000,
-    epsilon_start=1.0,
-    epsilon_end=0.05,
+    # Four-phase piecewise-linear ε schedule expressed as (step, value)
+    # waypoints. Default mirrors 185_ppo's "0.5 → 0.05 over 5M" fast initial
+    # decay (matches the new PPO entropy schedule), then continues sc-hra
+    # down to 0.01 by 20M, with a long slow tail to 0.005 by 100M. Pass a
+    # custom list to override; pass None to use the default built from
+    # total_timesteps below.
+    epsilon_schedule=None,
     # Resume / checkpointing
     resume_path=None,
     checkpoint_freq=1_000_000,
@@ -1369,6 +1533,19 @@ def league_train(
         eval_env = make_env(WeightedRandomPlayer(Color.RED))
         n_actions = vec_env.action_space.n
 
+        # Default ε schedule (4-phase piecewise linear). Mirrors the new
+        # 185_ppo entropy schedule (fast 0.5 → 0.05 over the first 5M)
+        # then keeps decaying past where PPO clamps: 0.05 → 0.01 over
+        # 5M–20M, plus a slow tail 0.01 → 0.005 from 20M out to
+        # total_timesteps. Pass `epsilon_schedule` to override the default.
+        if epsilon_schedule is None:
+            epsilon_schedule = [
+                (0, 0.5),
+                (5_000_000, 0.05),
+                (20_000_000, 0.01),
+                (max(20_000_001, total_timesteps), 0.005),
+            ]
+
         agent = SCHRAAgent(
             n_actions=n_actions,
             lr_critic=lr_critic_start,
@@ -1379,9 +1556,7 @@ def league_train(
             target_update_freq=target_update_freq,
             train_freq=train_freq,
             warmup_steps=warmup_steps,
-            epsilon_start=epsilon_start,
-            epsilon_end=epsilon_end,
-            epsilon_decay_steps=total_timesteps,
+            epsilon_schedule=epsilon_schedule,
         )
 
         # SB3 logger: prints the same key/value table format 185_ppo gets from
@@ -1808,6 +1983,13 @@ if __name__ == "__main__":
         "--device", type=str, default="cpu",
         help="Compute device: cpu, gpu (auto-pick cuda/mps), mps (Mac GPU), cuda, or auto.",
     )
+    parser.add_argument(
+        "--n-envs", type=int, default=15,
+        help="Number of parallel envs for league training via SubprocVecEnv "
+             "(only used with --league / --league-continue). Default 15 matches "
+             "Modal cpu=16 reservation; bump up on local machines with more "
+             "P-cores (e.g. 16 on a 20-core M-series Mac).",
+    )
 
     args = parser.parse_args()
 
@@ -1828,6 +2010,7 @@ if __name__ == "__main__":
             checkpoint_freq=args.checkpoint_freq,
             start_stage=args.start_stage,
             device=args.device,
+            n_envs=args.n_envs,
         )
     elif args.mode == "train":
         train(
