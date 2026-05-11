@@ -853,6 +853,17 @@ class SCHRAAgent:
             n=self.n_step, gamma=gamma, n_channels=N_CHANNELS,
         )
 
+        # Running ω stats across every (env, step) sample seen by
+        # select_actions_batch since the last pop_omega_stats() call.
+        # Reset by pop_omega_stats() at each TB dump, so the logged
+        # mean/std/min/max are aggregated over the full dump window
+        # (~32k env-steps × n_envs ≈ hundreds of thousands of samples).
+        self._omega_sum = np.zeros(N_CHANNELS, dtype=np.float64)
+        self._omega_sumsq = np.zeros(N_CHANNELS, dtype=np.float64)
+        self._omega_min = np.full(N_CHANNELS, np.inf, dtype=np.float64)
+        self._omega_max = np.full(N_CHANNELS, -np.inf, dtype=np.float64)
+        self._omega_count = 0
+
         # Step counter
         self.total_steps = 0
  
@@ -1089,10 +1100,45 @@ class SCHRAAgent:
         return loss.item()
  
     def get_omega(self, state):
-        """Get current meta-weights for a state (for logging/visualization)."""
+        """Get current meta-weights for a state (for logging/visualization).
+
+        Single-state point sample. Prefer pop_omega_stats() for logging
+        during vectorized training; it aggregates ω across all states
+        the agent actually saw between dumps.
+        """
         state_t = torch.FloatTensor(state).unsqueeze(0).to(DEVICE)
         with torch.no_grad():
             return self.meta_net(state_t).squeeze(0).cpu().numpy()
+
+    def pop_omega_stats(self):
+        """Return aggregated ω statistics across every (env, step) sample
+        observed by select_actions_batch since the last call, and reset
+        the accumulators.
+
+        Returns a dict {"mean", "std", "min", "max", "count"} where each
+        value (except count) is a length-N_CHANNELS float32 array, or
+        None if no samples have been accumulated.
+        """
+        n = self._omega_count
+        if n == 0:
+            return None
+        mean = self._omega_sum / n
+        # Var ≥ 0 in exact arithmetic; clamp for float roundoff.
+        var = np.maximum(0.0, self._omega_sumsq / n - mean ** 2)
+        std = np.sqrt(var)
+        stats = {
+            "mean": mean.astype(np.float32),
+            "std": std.astype(np.float32),
+            "min": self._omega_min.astype(np.float32),
+            "max": self._omega_max.astype(np.float32),
+            "count": n,
+        }
+        self._omega_sum.fill(0.0)
+        self._omega_sumsq.fill(0.0)
+        self._omega_min.fill(np.inf)
+        self._omega_max.fill(-np.inf)
+        self._omega_count = 0
+        return stats
 
     def select_actions_batch(self, states, valid_actions_list, masks_array):
         """Vectorized action selection for a batch of envs.
@@ -1141,8 +1187,21 @@ class SCHRAAgent:
             ).view(N_CHANNELS, 1, 1)
             q_norm = (q_stack - means) / stds  # (N_CHANNELS, n_envs, n_actions)
 
-            # Meta-weights per env: (n_envs, N_CHANNELS) → (N_CHANNELS, n_envs, 1)
-            omega = self.meta_net(states_t).T.unsqueeze(-1)
+            # Meta-weights per env: (n_envs, N_CHANNELS).
+            omega_raw = self.meta_net(states_t)
+
+            # Accumulate ω stats over (env, step) samples so TB logs the
+            # distributional mean/std/min/max over the dump window rather
+            # than a single-state snapshot. ~free (one cpu copy per iter).
+            omega_np = omega_raw.detach().cpu().numpy()  # (n_envs, N_CHANNELS)
+            self._omega_sum += omega_np.sum(axis=0)
+            self._omega_sumsq += np.square(omega_np).sum(axis=0)
+            self._omega_min = np.minimum(self._omega_min, omega_np.min(axis=0))
+            self._omega_max = np.maximum(self._omega_max, omega_np.max(axis=0))
+            self._omega_count += omega_np.shape[0]
+
+            # Reshape for broadcasted weighted sum: (N_CHANNELS, n_envs, 1)
+            omega = omega_raw.T.unsqueeze(-1)
             q_final = (omega * q_norm).sum(dim=0)  # (n_envs, n_actions)
 
             # Mask invalid actions.
@@ -1344,6 +1403,16 @@ def make_env(enemy=None):
         config={
             "enemies": [enemy],
             "vps_to_win": 15,
+            # Match the SCHRAWrapper HOARD_PENALTY threshold (>9). The env's
+            # default discard_limit is 7, which would force the agent to
+            # discard down to 7 on every 7-roll — eating the very excess
+            # cards we're trying to penalize the agent for holding, AND
+            # making the penalty schedule env-mediated rather than
+            # consequence-mediated. With discard_limit=9 the env only
+            # forces a discard once the agent is already deep in the
+            # penalized zone, so the hoard penalty correctly represents
+            # the *risk* of having to discard.
+            "discard_limit": 9,
         },
     )
     env = SCHRAWrapper(env)
@@ -1414,6 +1483,7 @@ def make_league_env(stage_val):
         config={
             "enemies": [WeightedRandomPlayer(Color.RED)],
             "vps_to_win": 15,
+            "discard_limit": 9,  # see comment in make_env
         },
     )
     env = LeagueWrapper(env, stage_val)
@@ -1983,10 +2053,23 @@ def league_train(
                 for name, val in last_critic_losses.items():
                     sb3_logger.record(f"train/{name}_loss", float(val))
 
-                omega = agent.get_omega(obs[0])
-                sb3_logger.record("omega/resource", float(omega[0]))
-                sb3_logger.record("omega/position", float(omega[1]))
-                sb3_logger.record("omega/vp", float(omega[2]))
+                # ω stats aggregated across every state seen since the last
+                # dump (mean/std/min/max per channel). Falls back to the
+                # single-state get_omega(obs[0]) snapshot if the agent
+                # hasn't produced any action-selection batches yet (e.g.
+                # warmup state on the very first dump).
+                omega_stats = agent.pop_omega_stats()
+                _omega_channels = ("resource", "position", "vp")
+                if omega_stats is not None:
+                    for c, name in enumerate(_omega_channels):
+                        sb3_logger.record(f"omega/{name}", float(omega_stats["mean"][c]))
+                        sb3_logger.record(f"omega/{name}_std", float(omega_stats["std"][c]))
+                        sb3_logger.record(f"omega/{name}_min", float(omega_stats["min"][c]))
+                        sb3_logger.record(f"omega/{name}_max", float(omega_stats["max"][c]))
+                else:
+                    omega = agent.get_omega(obs[0])
+                    for c, name in enumerate(_omega_channels):
+                        sb3_logger.record(f"omega/{name}", float(omega[c]))
 
                 sb3_logger.record("time/fps", int((step - start_step) / elapsed))
                 sb3_logger.record("time/iterations", iterations)
