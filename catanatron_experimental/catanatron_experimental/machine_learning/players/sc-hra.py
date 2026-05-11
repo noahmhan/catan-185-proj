@@ -962,13 +962,19 @@ class SCHRAAgent:
         else:
             action = q_final.argmax().item()
  
-        # Store Q_i(s, a) for the chosen action in episode buffer
+        # Store the NORMALIZED per-channel Q for the chosen action in the
+        # episode buffer. Action selection uses q_normalized (above) to
+        # form Q_final = Σ ω_i · Q̃_i, so the meta-net regression target
+        # must be computed against the same q̃ representation; storing
+        # raw Q_i (as we used to) makes train_meta fit ω in a space that
+        # doesn't match action selection, silently biasing ω to absorb
+        # the per-channel scale difference.
         q_at_action = torch.FloatTensor([
-            q_values[i][action].item() for i in range(N_CHANNELS)
+            q_normalized[i][action].item() for i in range(N_CHANNELS)
         ])
         self.episode_buffer.append((
             torch.FloatTensor(state),  # (FEATURE_DIM,)
-            q_at_action,               # (N_CHANNELS,) — detached from graph
+            q_at_action,               # (N_CHANNELS,) — normalized, detached
         ))
  
         return action
@@ -1219,10 +1225,15 @@ class SCHRAAgent:
             else:
                 actions[env_idx] = best_actions[env_idx]
 
-        # Store Q_i(s_t, a_t) for each env's chosen action in its episode buffer.
-        # q_stack: (N_CHANNELS, n_envs, n_actions); gather across action dim.
+        # Store the NORMALIZED per-channel Q (NOT raw q_stack_np) for each
+        # env's chosen action. Action selection above mixes Q values via
+        # Σ ω_i · q_norm_i, so train_meta_for_env must regress ω against
+        # the same q̃ representation — otherwise ω is learned in raw-Q
+        # space and applied in normalized-Q space, silently distorting
+        # the channel weights by each channel's std.
+        q_norm_np = q_norm.cpu().numpy()  # (N_CHANNELS, n_envs, n_actions)
         env_range = np.arange(n_envs)
-        q_at_actions = q_stack_np[:, env_range, actions]  # (N_CHANNELS, n_envs)
+        q_at_actions = q_norm_np[:, env_range, actions]  # (N_CHANNELS, n_envs)
         for env_idx in range(n_envs):
             buf = self.episode_buffers.setdefault(env_idx, [])
             buf.append((
