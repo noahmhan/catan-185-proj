@@ -89,8 +89,12 @@ MODEL_DIR = os.path.join(os.path.dirname(__file__), "schra_model")
 def get_player_hand(state, color):
     key = player_key(state, color)
     return {r: state.player_state[f"{key}_{r}_IN_HAND"] for r in RESOURCE_TYPES}
- 
- 
+
+
+def get_hand_size(state, color):
+    return player_num_resource_cards(state, color)
+
+
 def get_victory_points(state, color):
     key = player_key(state, color)
     return state.player_state[f"{key}_ACTUAL_VICTORY_POINTS"]
@@ -277,18 +281,26 @@ def compute_features(state, color, opp_color):
  
 class QNetwork(nn.Module):
     """DQN critic for a single reward channel.
-    Input: state features (FEATURE_DIM).  Output: Q(s,a) for all actions."""
- 
-    def __init__(self, state_dim, n_actions, hidden=256):
+    Input: state features (FEATURE_DIM).  Output: Q(s,a) for all actions.
+
+    ``hidden`` may be an int (single hidden size, two layers) or a sequence
+    of ints (one Linear+ReLU per element). Default (512, 256) gives a wider
+    first layer than the second to absorb the ~290-action output head.
+    """
+
+    def __init__(self, state_dim, n_actions, hidden=(512, 256)):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(state_dim, hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, hidden),
-            nn.ReLU(),
-            nn.Linear(hidden, n_actions),
-        )
- 
+        if isinstance(hidden, int):
+            hidden = (hidden, hidden)
+        layers = []
+        prev = state_dim
+        for h in hidden:
+            layers.append(nn.Linear(prev, h))
+            layers.append(nn.ReLU())
+            prev = h
+        layers.append(nn.Linear(prev, n_actions))
+        self.net = nn.Sequential(*layers)
+
     def forward(self, x):
         return self.net(x)
  
@@ -476,10 +488,34 @@ class SCHRAWrapper(Wrapper):
     Wraps Catanatron-v0 to:
     1. Replace observations with 25-dim hand-crafted features.
     2. Compute per-channel rewards at every step and expose in info.
-    3. Compute terminal reward at episode end.
+    3. Compute terminal reward at episode end and fold it into the VP
+       channel so the VP critic actually sees win/loss signal.
     4. Track episode stats for logging.
+
+    Reward channels:
+
+    - r_resource: PPO-style instantaneous (NOT a potential-difference on
+      hand size). Rewards earning, rewards spending-when-building, only
+      penalizes hoarding past the discard threshold. Previous version
+      used delta(resource_flow_score) which made building NEGATIVE in
+      this channel, biasing the agent toward passing.
+
+    - r_position: delta of network_position_score, scaled 0.3. Unchanged.
+
+    - r_vp: vp_proximity_reward + r_terminal on the final step. Folding
+      the ±15 terminal reward into the VP channel gives Q_vp a magnitude
+      that the meta-net's softmax-weighted-sum can actually fit against
+      its r_terminal regression target (previously the meta-net had to
+      reach ±15 from a convex combo of channel Q-values all bounded near
+      ~10, which forced softmax saturation onto whichever channel was
+      most negative — usually the broken resource channel).
     """
- 
+
+    # Tuned to match 185_ppo.CatanRewardWrapper exactly.
+    EARN_REWARD = 0.05
+    SPEND_REWARD = 0.05
+    HOARD_PENALTY = 0.05
+
     def __init__(self, env):
         super().__init__(env)
         self.p0_color = Color.BLUE
@@ -487,32 +523,44 @@ class SCHRAWrapper(Wrapper):
         self.observation_space = gymnasium.spaces.Box(
             low=-np.inf, high=np.inf, shape=(FEATURE_DIM,), dtype=np.float32
         )
-        self._prev_resource_score = 0.0
+        self._prev_hand_size = 0
+        self._prev_building_count = 0
+        self._prev_road_count = 0
         self._prev_position_score = 0.0
         self._prev_vps = 0
         self._prev_knights = 0
- 
+
         # episode accumulators
         self._ep_r = np.zeros(N_CHANNELS)
         self._ep_r_terminal = 0.0
         self._ep_steps = 0
- 
+
     def _features(self, state):
         return compute_features(state, self.p0_color, self.opp_color)
- 
+
     def _safe_position_score(self, state):
         try:
             return network_position_score(state, self.p0_color)
         except Exception:
             return 0.0
- 
+
+    def _building_count(self, state):
+        return sum(
+            1 for _, (c, _) in state.board.buildings.items() if c == self.p0_color
+        )
+
+    def _road_count(self, state):
+        return sum(1 for _, c in state.board.roads.items() if c == self.p0_color) // 2
+
     def get_valid_actions(self):
         return self.env.unwrapped.get_valid_actions()
- 
+
     def reset(self, **kwargs):
         obs, info = self.env.reset(**kwargs)
         state = self.env.unwrapped.game.state
-        self._prev_resource_score = resource_flow_score(state, self.p0_color)
+        self._prev_hand_size = get_hand_size(state, self.p0_color)
+        self._prev_building_count = self._building_count(state)
+        self._prev_road_count = self._road_count(state)
         self._prev_position_score = self._safe_position_score(state)
         self._prev_vps = get_victory_points(state, self.p0_color)
         self._prev_knights = get_knights_played(state, self.p0_color)
@@ -520,24 +568,47 @@ class SCHRAWrapper(Wrapper):
         self._ep_r_terminal = 0.0
         self._ep_steps = 0
         return self._features(state), info
- 
+
     def step(self, action):
         obs, _, terminated, truncated, info = self.env.step(action)
         game = self.env.unwrapped.game
         state = game.state
         done = terminated or truncated
- 
-        # Channel 0: resource flow delta
-        cur_resource = resource_flow_score(state, self.p0_color)
-        r_resource = cur_resource - self._prev_resource_score
-        self._prev_resource_score = cur_resource
- 
+
+        # Channel 0: resource throughput (instantaneous, PPO-style).
+        #   + EARN_REWARD per card drawn (positive hand delta from any source)
+        #   + SPEND_REWARD per card spent in the same step that we placed
+        #     a new building or road (so spending only counts when it
+        #     translates into a build, not when it's a discard / robber /
+        #     monopoly steal)
+        #   - HOARD_PENALTY per card held above the discard threshold (9)
+        cur_hand = get_hand_size(state, self.p0_color)
+        cur_buildings = self._building_count(state)
+        cur_roads = self._road_count(state)
+        delta_hand = cur_hand - self._prev_hand_size
+        built_something = (
+            cur_buildings > self._prev_building_count
+            or cur_roads > self._prev_road_count
+        )
+        r_resource = 0.0
+        if delta_hand > 0:
+            r_resource += self.EARN_REWARD * delta_hand
+        elif delta_hand < 0 and built_something:
+            r_resource += self.SPEND_REWARD * (-delta_hand)
+        if cur_hand > 9:
+            r_resource -= self.HOARD_PENALTY * (cur_hand - 9)
+        self._prev_hand_size = cur_hand
+        self._prev_building_count = cur_buildings
+        self._prev_road_count = cur_roads
+
         # Channel 1: network position delta (scaled 0.3)
         cur_position = self._safe_position_score(state)
         r_position = 0.3 * (cur_position - self._prev_position_score)
         self._prev_position_score = cur_position
- 
-        # Channel 2: VP proximity
+
+        # Channel 2: VP proximity. Terminal win/loss reward is folded in
+        # below on the done step so Q_vp can actually capture the outcome
+        # signal that the meta-net regresses against.
         r_vp = vp_proximity_reward(
             state, self.p0_color,
             self._prev_vps, self._prev_knights,
@@ -545,37 +616,122 @@ class SCHRAWrapper(Wrapper):
         )
         self._prev_vps = get_victory_points(state, self.p0_color)
         self._prev_knights = get_knights_played(state, self.p0_color)
- 
-        rewards = np.array([r_resource, r_position, r_vp], dtype=np.float32)
- 
+
         r_terminal = 0.0
         if done:
             r_terminal = terminal_reward(game, self.p0_color)
- 
-        # expose everything in info
+            r_vp += r_terminal
+
+        rewards = np.array([r_resource, r_position, r_vp], dtype=np.float32)
+
+        # expose everything in info. r_terminal is also kept as its own
+        # entry (UNCHANGED) so train_meta_for_env can still use it as the
+        # retrospective bandit regression target.
         info["rewards"] = rewards
         info["r_terminal"] = r_terminal
         if done:
             info["win"] = int(game.winning_color() == self.p0_color)
- 
+
         self._ep_r += rewards
         self._ep_r_terminal += r_terminal
         self._ep_steps += 1
- 
+
         if done:
             info["ep_r_resource"] = float(self._ep_r[0])
             info["ep_r_position"] = float(self._ep_r[1])
             info["ep_r_vp"] = float(self._ep_r[2])
             info["ep_r_terminal"] = float(self._ep_r_terminal)
             info["ep_steps"] = self._ep_steps
- 
+
         return self._features(state), 0.0, terminated, truncated, info
  
  
 # ================================================================
+# N-STEP RETURN PROCESSOR
+# ================================================================
+
+class NStepProcessor:
+    """Per-env rolling queue that converts 1-step env transitions into
+    n-step Bellman targets before they enter the replay buffer.
+
+    Given the sequence of transitions (s_t, a_t, r_t, s_{t+1}, done_t)
+    for one env, it emits replay-buffer entries of the form:
+
+        (s_t, a_t, R_n(t), s_{t+n}, term_within_window,
+         mask_t, mask_{t+n})
+
+    where R_n(t) = Σ_{k=0..n-1} γ^k · r_{t+k}, truncated whenever the
+    episode ends within the window (in which case term_within_window is
+    True and s_{t+n}/mask_{t+n} are clamped to the post-terminal values,
+    which are zeroed out anyway by (1 - done) in the Bellman target).
+
+    For n=1 the behavior is identical to the original 1-step setup, so
+    this class is the single code path regardless of self.n_step.
+    """
+
+    def __init__(self, n, gamma, n_channels):
+        self.n = int(n)
+        self.gamma = float(gamma)
+        self.n_channels = int(n_channels)
+        # Per-env FIFO queue. Lazy-init keyed by env_idx so we don't need
+        # to know n_envs at construction time. List (not deque) because n
+        # is tiny (1–5) and list pop(0) is O(n) but n=3 ⇒ negligible.
+        self.queues: dict = {}
+        # γ^k for k=0..n-1, precomputed for the steady-state path.
+        self.gamma_powers = np.array(
+            [gamma ** k for k in range(self.n)], dtype=np.float32
+        )
+
+    def push(self, env_idx, state, action, rewards, next_state, done,
+             action_mask, next_action_mask):
+        """Add a 1-step transition for env_idx. Returns 0..N replay-buffer
+        emissions ready to be passed positionally to ReplayBuffer.push().
+
+        Steady state (queue full, no done): 1 emission.
+        On done: flushes the queue → up to n emissions (truncated returns).
+        Otherwise: 0 emissions (queue still warming up)."""
+        q = self.queues.setdefault(env_idx, [])
+        q.append((state, action, np.asarray(rewards, dtype=np.float32), action_mask))
+
+        emissions = []
+
+        if done:
+            # Flush every queued transition with its truncated n-step
+            # return, ending at the terminal step. done=True so the
+            # Bellman bootstrap is zeroed out anyway.
+            L = len(q)
+            for j in range(L):
+                s, a, _, am = q[j]
+                n_step_r = np.zeros(self.n_channels, dtype=np.float32)
+                for k in range(j, L):
+                    n_step_r += (self.gamma ** (k - j)) * q[k][2]
+                emissions.append(
+                    (s, a, n_step_r, next_state, True, am, next_action_mask)
+                )
+            q.clear()
+        elif len(q) >= self.n:
+            # Standard n-step emit for the oldest entry, then pop it.
+            n_step_r = np.zeros(self.n_channels, dtype=np.float32)
+            for k in range(self.n):
+                n_step_r += self.gamma_powers[k] * q[k][2]
+            s, a, _, am = q[0]
+            emissions.append(
+                (s, a, n_step_r, next_state, False, am, next_action_mask)
+            )
+            q.pop(0)
+
+        return emissions
+
+    def reset_env(self, env_idx):
+        """Drop any pending entries for an env (e.g., on manual reset)."""
+        if env_idx in self.queues:
+            self.queues[env_idx].clear()
+
+
+# ================================================================
 # SC-HRA AGENT
 # ================================================================
- 
+
 class SCHRAAgent:
     """
     State-Conditioned Hybrid Reward Architecture agent.
@@ -595,7 +751,7 @@ class SCHRAAgent:
         self,
         n_actions,
         state_dim=FEATURE_DIM,
-        hidden_critic=256,
+        hidden_critic=(512, 256),
         hidden_meta=128,
         lr_critic=1e-4,
         lr_meta=3e-4,
@@ -611,13 +767,24 @@ class SCHRAAgent:
         epsilon_mid=None,
         epsilon_decay_steps_total=None,
         epsilon_schedule=None,
+        n_step=3,
+        polyak_tau=0.005,
     ):
         self.n_actions = n_actions
         self.gamma = gamma
         self.batch_size = batch_size
+        # NOTE: target_update_freq is retained for hparams-checkpoint back
+        # compat but is no longer used — target nets are updated every grad
+        # step via Polyak averaging with polyak_tau below.
         self.target_update_freq = target_update_freq
+        self.polyak_tau = float(polyak_tau)
         self.train_freq = train_freq
         self.warmup_steps = warmup_steps
+        # n-step return horizon and the corresponding Bellman discount factor
+        # γ^n. n_step=1 reproduces the original 1-step TD behavior; higher
+        # n gives lower-bias targets at the cost of higher variance.
+        self.n_step = int(n_step)
+        self.gamma_n = gamma ** self.n_step
         self.epsilon_start = epsilon_start
         self.epsilon_end = epsilon_end
         self.epsilon_decay_steps = epsilon_decay_steps
@@ -679,6 +846,12 @@ class SCHRAAgent:
         # Disjoint from self.episode_buffer; populated by select_actions_batch
         # and consumed by train_meta_for_env.
         self.episode_buffers: dict = {}
+
+        # Per-env n-step return processor. All store_transition() calls go
+        # through this; for n_step=1 it's a pass-through.
+        self.nstep_processor = NStepProcessor(
+            n=self.n_step, gamma=gamma, n_channels=N_CHANNELS,
+        )
 
         # Step counter
         self.total_steps = 0
@@ -790,27 +963,53 @@ class SCHRAAgent:
         return action
  
     def store_transition(self, state, action, rewards, next_state, done,
-                         action_mask, next_action_mask):
-        """Store a transition in the replay buffer."""
-        self.replay_buffer.push(
+                         action_mask, next_action_mask, env_idx=0):
+        """Add a 1-step env transition. Internally routed through the
+        per-env n-step processor, which only emits to the replay buffer
+        once n consecutive transitions have accumulated (or on episode
+        end, when it flushes truncated returns).
+
+        env_idx identifies which env queue to use in the n-step processor;
+        defaults to 0 for the legacy single-env path. The vectorized
+        league trainer passes the actual env index per env per iter.
+
+        total_steps is incremented per ENV STEP, not per buffer push, so
+        warmup / epsilon / train_freq cadences are unaffected by n_step."""
+        emissions = self.nstep_processor.push(
+            env_idx,
             state, action, rewards, next_state, done,
             action_mask, next_action_mask,
         )
+        for em in emissions:
+            self.replay_buffer.push(*em)
         self.total_steps += 1
- 
+
     def train_critics(self):
-        """One gradient step on each critic using a batch from replay buffer."""
+        """One gradient step on each critic using a batch from replay buffer.
+
+        Uses:
+          - Double-DQN target (online net picks action, target net evals).
+          - n-step Bellman bootstrap: target = R_n + γ^n · (1-done) · max_Q'(s_{t+n}).
+            R_n and done are produced by NStepProcessor; γ^n is precomputed
+            as self.gamma_n.
+          - Huber (smooth_l1) loss to limit gradient blow-up from the ±15
+            terminal-VP reward channel.
+          - Polyak (soft) target update every grad step instead of a hard
+            copy every target_update_freq steps. Smoother targets → no
+            loss spikes at copy points.
+        """
         if len(self.replay_buffer) < self.batch_size:
             return {}
         if self.total_steps < self.warmup_steps:
             return {}
         if self.total_steps % self.train_freq != 0:
             return {}
- 
+
         states, actions, rewards, next_states, dones, _, next_masks = \
             self.replay_buffer.sample(self.batch_size)
- 
+
         losses = {}
+        tau = self.polyak_tau
         for i in range(N_CHANNELS):
             # Double DQN target
             with torch.no_grad():
@@ -818,34 +1017,35 @@ class SCHRAAgent:
                 next_q_online = self.critics[i](next_states)   # (batch, n_actions)
                 next_q_online[~next_masks] = float("-inf")
                 best_actions = next_q_online.argmax(dim=1, keepdim=True)  # (batch, 1)
- 
+
                 # Target network evaluates that action
                 next_q_target = self.target_critics[i](next_states)  # (batch, n_actions)
                 max_next_q = next_q_target.gather(1, best_actions).squeeze(1)  # (batch,)
- 
-                target = rewards[:, i] + self.gamma * (1.0 - dones) * max_next_q
- 
+
+                target = rewards[:, i] + self.gamma_n * (1.0 - dones) * max_next_q
+
             # Current Q-value for taken action
             current_q = self.critics[i](states).gather(
                 1, actions.unsqueeze(1)
             ).squeeze(1)  # (batch,)
- 
-            loss = F.mse_loss(current_q, target)
- 
+
+            loss = F.smooth_l1_loss(current_q, target)
+
             self.critic_optimizers[i].zero_grad()
             loss.backward()
             nn.utils.clip_grad_norm_(self.critics[i].parameters(), 10.0)
             self.critic_optimizers[i].step()
- 
+
             losses[f"critic_{i}"] = loss.item()
- 
-        # Update target networks
-        if self.total_steps % self.target_update_freq == 0:
-            for i in range(N_CHANNELS):
-                self.target_critics[i].load_state_dict(
-                    self.critics[i].state_dict()
-                )
- 
+
+            # Polyak (soft) target update: θ' ← (1-τ)·θ' + τ·θ
+            with torch.no_grad():
+                for p_t, p in zip(
+                    self.target_critics[i].parameters(),
+                    self.critics[i].parameters(),
+                ):
+                    p_t.data.mul_(1.0 - tau).add_(p.data, alpha=tau)
+
         return losses
  
     def train_meta(self, r_terminal):
@@ -1688,11 +1888,15 @@ def league_train(
                 # On done, SubprocVecEnv has already auto-reset env i, so
                 # new_obs[i] is the new episode's first obs. The TD target
                 # zeros next-Q via (1-done), so the stale next_state / mask
-                # don't affect learning.
+                # don't affect learning. env_idx=i routes through the
+                # correct per-env queue in the n-step processor; the
+                # processor also flushes its queue on done_i=True so
+                # transitions from different episodes never get joined.
                 agent.store_transition(
                     obs[i], int(actions[i]), rewards_i,
                     new_obs[i], done_i,
                     masks[i], next_masks[i],
+                    env_idx=i,
                 )
                 episode_channel_rewards[i] += rewards_i
                 episode_steps[i] += 1
