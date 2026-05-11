@@ -515,6 +515,12 @@ class SCHRAWrapper(Wrapper):
     EARN_REWARD = 0.05
     SPEND_REWARD = 0.05
     HOARD_PENALTY = 0.05
+    # Scale applied to the final r_resource so the channel's magnitude is
+    # comparable to r_position / r_vp. Without this, per-episode r_resource
+    # runs ~8 while position/vp run ~3, biasing the meta-net's weighting and
+    # the critic toward whichever signal is loudest rather than most
+    # win-predictive.
+    RESOURCE_SCALE = 1.0 / 3.0
 
     def __init__(self, env):
         super().__init__(env)
@@ -597,6 +603,7 @@ class SCHRAWrapper(Wrapper):
             r_resource += self.SPEND_REWARD * (-delta_hand)
         if cur_hand > 9:
             r_resource -= self.HOARD_PENALTY * (cur_hand - 9)
+        r_resource *= self.RESOURCE_SCALE
         self._prev_hand_size = cur_hand
         self._prev_building_count = cur_buildings
         self._prev_road_count = cur_roads
@@ -675,7 +682,7 @@ class NStepProcessor:
         self.n_channels = int(n_channels)
         # Per-env FIFO queue. Lazy-init keyed by env_idx so we don't need
         # to know n_envs at construction time. List (not deque) because n
-        # is tiny (1–5) and list pop(0) is O(n) but n=3 ⇒ negligible.
+        # is tiny (1–5) and list pop(0) is O(n) but n=5 ⇒ negligible.
         self.queues: dict = {}
         # γ^k for k=0..n-1, precomputed for the steady-state path.
         self.gamma_powers = np.array(
@@ -767,7 +774,7 @@ class SCHRAAgent:
         epsilon_mid=None,
         epsilon_decay_steps_total=None,
         epsilon_schedule=None,
-        n_step=3,
+        n_step=5,
         polyak_tau=0.005,
     ):
         self.n_actions = n_actions
