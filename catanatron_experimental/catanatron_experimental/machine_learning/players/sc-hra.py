@@ -1,14 +1,14 @@
 """
 SC-HRA: State-Conditioned Hybrid Reward Architecture for 1v1 Catan
- 
+
 Three independent DQN critics (one per reward channel) combined via a
 learned meta-weighting network. The meta-network is trained with a
 retrospective bandit objective at the end of each episode.
- 
+
 Requirements:
     pip install catanatron[gym] torch tensorboard
 """
- 
+
 import os
 import random
 import math
@@ -27,18 +27,18 @@ from stable_baselines3.common.vec_env import SubprocVecEnv
 
 import gymnasium
 from gymnasium import Wrapper
- 
+
 from catanatron import Color, Player
 from catanatron.players.weighted_random import WeightedRandomPlayer
 from catanatron.players.minimax import AlphaBetaPlayer
 from catanatron.players.value import ValueFunctionPlayer
 from catanatron.state_functions import player_key, player_num_resource_cards
 import catanatron.gym
- 
+
 # ================================================================
 # CONFIG
 # ================================================================
- 
+
 DEVICE = torch.device("cpu")
 FEATURE_DIM = 25
 N_CHANNELS = 3  # resource, position, vp
@@ -76,16 +76,16 @@ def _resolve_device(name: str) -> torch.device:
         print("[device] No GPU available, falling back to CPU.")
         return torch.device("cpu")
     raise ValueError(f"Unknown device: {name!r}")
- 
+
 RESOURCE_TYPES = ["WOOD", "BRICK", "SHEEP", "WHEAT", "ORE"]
- 
+
 MODEL_DIR = os.path.join(os.path.dirname(__file__), "schra_model")
- 
- 
+
+
 # ================================================================
 # STATE HELPERS (shared with baseline)
 # ================================================================
- 
+
 def get_player_hand(state, color):
     key = player_key(state, color)
     return {r: state.player_state[f"{key}_{r}_IN_HAND"] for r in RESOURCE_TYPES}
@@ -98,22 +98,22 @@ def get_hand_size(state, color):
 def get_victory_points(state, color):
     key = player_key(state, color)
     return state.player_state[f"{key}_ACTUAL_VICTORY_POINTS"]
- 
- 
+
+
 def get_knights_played(state, color):
     key = player_key(state, color)
     return state.player_state.get(f"{key}_PLAYED_KNIGHT", 0)
- 
- 
+
+
 def get_longest_road_length(state, color):
     key = player_key(state, color)
     return state.player_state.get(f"{key}_LONGEST_ROAD_LENGTH", 0)
- 
- 
+
+
 # ================================================================
 # REWARD CHANNEL FUNCTIONS (shared with baseline)
 # ================================================================
- 
+
 def resource_flow_score(state, color):
     hand = get_player_hand(state, color)
     hand_size = sum(hand.values())
@@ -124,8 +124,8 @@ def resource_flow_score(state, color):
     if hand_size > 9:
         hoard_penalty = 0.2 + 0.1 * (hand_size - 9)
     return diversity_bonus + quantity_bonus - hoard_penalty
- 
- 
+
+
 def network_position_score(state, color):
     """
     Network Position Channel (score function, reward = delta between turns):
@@ -194,8 +194,8 @@ def network_position_score(state, color):
         score += 0.06 * pip_sum
 
     return score
- 
- 
+
+
 def vp_proximity_reward(state, color, prev_vps, prev_knights, opp_color):
     current_vps = get_victory_points(state, color)
     vp_delta = current_vps - prev_vps
@@ -213,8 +213,8 @@ def vp_proximity_reward(state, color, prev_vps, prev_knights, opp_color):
             feasibility = min(1.0, 3.0 / knights_needed)
             knight_reward = new_knights * 0.3 * feasibility / (1 + max(0, knights_remaining))
     return float(vp_delta) + knight_reward
- 
- 
+
+
 def terminal_reward(game, color):
     winning_color = game.winning_color()
     if winning_color is None:
@@ -227,12 +227,12 @@ def terminal_reward(game, color):
     )
     #vp_margin = 0.5 * (my_vps - opp_vps)
     return (15.0 if winning_color == color else -15.0)
- 
- 
+
+
 # ================================================================
 # FEATURE COMPUTATION (shared with baseline)
 # ================================================================
- 
+
 def compute_features(state, color, opp_color):
     hand = get_player_hand(state, color)
     opp_hand = get_player_hand(state, opp_color)
@@ -245,7 +245,7 @@ def compute_features(state, color, opp_color):
     opp_road = get_longest_road_length(state, opp_color)
     pos_score = network_position_score(state, color)
     opp_pos_score = network_position_score(state, opp_color)
- 
+
     return np.array([
         hand_size / 10.0,
         sum(1 for v in hand.values() if v > 0) / 5.0,
@@ -273,12 +273,12 @@ def compute_features(state, color, opp_color):
         (pos_score - opp_pos_score) / 10.0,
         resource_flow_score(state, color) / 2.0,
     ], dtype=np.float32)
- 
- 
+
+
 # ================================================================
 # NEURAL NETWORKS
 # ================================================================
- 
+
 class QNetwork(nn.Module):
     """DQN critic for a single reward channel.
     Input: state features (FEATURE_DIM).  Output: Q(s,a) for all actions.
@@ -303,11 +303,11 @@ class QNetwork(nn.Module):
 
     def forward(self, x):
         return self.net(x)
- 
- 
+
+
 class MetaWeightNetwork(nn.Module):
     """Outputs softmax weights over N reward channels conditioned on state."""
- 
+
     def __init__(self, state_dim, n_channels=N_CHANNELS, hidden=128):
         super().__init__()
         self.net = nn.Sequential(
@@ -317,15 +317,15 @@ class MetaWeightNetwork(nn.Module):
             nn.ReLU(),
             nn.Linear(64, n_channels),
         )
- 
+
     def forward(self, x):
         return F.softmax(self.net(x), dim=-1)
- 
- 
+
+
 # ================================================================
 # REPLAY BUFFER
 # ================================================================
- 
+
 # Transition is kept around as a documentation aid (field names + dtypes)
 # and for back-compat in load_checkpoint when reading older deque-of-tuple
 # replay buffers. The vectorized ReplayBuffer below does not use it on the
@@ -448,22 +448,22 @@ class ReplayBuffer:
         vectorized."""
         for t in tuples:
             self.push(*t)
- 
- 
+
+
 # ================================================================
 # Q-VALUE NORMALIZER
 # ================================================================
- 
+
 class RunningNormalizer:
     """Welford's online algorithm for running mean/std.
     Used to normalize Q-values before combining in the meta-network
     so all channels contribute at comparable scale."""
- 
+
     def __init__(self):
         self.mean = 0.0
         self.var = 1.0
         self.count = 0
- 
+
     def update(self, values):
         """Update with a batch of values (numpy array or scalar)."""
         values = np.atleast_1d(np.asarray(values, dtype=np.float64))
@@ -473,16 +473,16 @@ class RunningNormalizer:
             self.mean += delta / self.count
             delta2 = v - self.mean
             self.var += (delta * delta2 - self.var) / self.count
- 
+
     def normalize(self, x):
         std = max(math.sqrt(self.var), 1e-8)
         return (x - self.mean) / std
- 
- 
+
+
 # ================================================================
 # SC-HRA ENVIRONMENT WRAPPER
 # ================================================================
- 
+
 class SCHRAWrapper(Wrapper):
     """
     Wraps Catanatron-v0 to:
@@ -520,7 +520,7 @@ class SCHRAWrapper(Wrapper):
     # runs ~8 while position/vp run ~3, biasing the meta-net's weighting and
     # the critic toward whichever signal is loudest rather than most
     # win-predictive.
-    RESOURCE_SCALE = 1.0 / 3.0
+    RESOURCE_SCALE = 3.0 / 5.0
 
     def __init__(self, env):
         super().__init__(env)
@@ -636,6 +636,13 @@ class SCHRAWrapper(Wrapper):
         # retrospective bandit regression target.
         info["rewards"] = rewards
         info["r_terminal"] = r_terminal
+        # Piggyback the next-step action mask on info so the trainer can
+        # avoid a separate env_method("get_valid_actions") round-trip after
+        # every step. Skipped on the terminal step because SubprocVecEnv
+        # will auto-reset and the trainer fetches fresh valid_actions only
+        # for done envs (see _league_step_collect in league_train).
+        if not done:
+            info["valid_actions"] = self.get_valid_actions()
         if done:
             info["win"] = int(game.winning_color() == self.p0_color)
 
@@ -651,8 +658,8 @@ class SCHRAWrapper(Wrapper):
             info["ep_steps"] = self._ep_steps
 
         return self._features(state), 0.0, terminated, truncated, info
- 
- 
+
+
 # ================================================================
 # N-STEP RETURN PROCESSOR
 # ================================================================
@@ -742,18 +749,18 @@ class NStepProcessor:
 class SCHRAAgent:
     """
     State-Conditioned Hybrid Reward Architecture agent.
- 
+
     Components:
         - 3 independent Double-DQN critics (one per reward channel)
         - 3 target networks (for stable TD targets)
         - 1 meta-weighting network (outputs channel weights conditioned on state)
         - 3 Q-value normalizers (running mean/std per channel)
- 
+
     Training:
         - Critics: standard Double-DQN with experience replay
         - Meta-network: retrospective bandit at episode end
     """
- 
+
     def __init__(
         self,
         n_actions,
@@ -811,7 +818,7 @@ class SCHRAAgent:
         # express schedules with more than one kink (e.g., fast initial
         # decay → moderate decay → long slow tail).
         self.epsilon_schedule = epsilon_schedule
- 
+
         # Critics (one per channel)
         self.critics = [
             QNetwork(state_dim, n_actions, hidden_critic).to(DEVICE)
@@ -824,19 +831,19 @@ class SCHRAAgent:
         for i in range(N_CHANNELS):
             self.target_critics[i].load_state_dict(self.critics[i].state_dict())
             self.target_critics[i].eval()
- 
+
         self.critic_optimizers = [
             optim.Adam(self.critics[i].parameters(), lr=lr_critic)
             for i in range(N_CHANNELS)
         ]
- 
+
         # Meta-weighting network
         self.meta_net = MetaWeightNetwork(state_dim, N_CHANNELS, hidden_meta).to(DEVICE)
         self.meta_optimizer = optim.Adam(self.meta_net.parameters(), lr=lr_meta)
- 
+
         # Q-value normalizers (one per channel)
         self.q_normalizers = [RunningNormalizer() for _ in range(N_CHANNELS)]
- 
+
         # Replay buffer (preallocated numpy arrays — see ReplayBuffer above)
         self.replay_buffer = ReplayBuffer(
             buffer_size,
@@ -844,7 +851,7 @@ class SCHRAAgent:
             n_actions=n_actions,
             n_channels=N_CHANNELS,
         )
- 
+
         # Episode buffer for meta-network training (single-env path)
         # Each entry: (state_tensor, q_values_tensor[3])
         self.episode_buffer = []
@@ -873,7 +880,7 @@ class SCHRAAgent:
 
         # Step counter
         self.total_steps = 0
- 
+
     def _epsilon(self):
         """Epsilon schedule.
 
@@ -920,23 +927,23 @@ class SCHRAAgent:
                 t = (step - s0) / max(1, s1 - s0)
                 return v0 + (v1 - v0) * t
         return sched[-1][1]
- 
+
     def select_action(self, state, valid_actions):
         """Epsilon-greedy over Q_final = Σ ω_i · Q_i, masked to legal actions.
         Also stores Q-values in episode buffer for meta-network training."""
- 
+
         state_t = torch.FloatTensor(state).unsqueeze(0).to(DEVICE)
- 
+
         with torch.no_grad():
             # Get Q-values from each critic
             q_values = []
             for i in range(N_CHANNELS):
                 q_i = self.critics[i](state_t).squeeze(0)  # (n_actions,)
                 q_values.append(q_i)
- 
+
             # Get meta-weights
             omega = self.meta_net(state_t).squeeze(0)  # (N_CHANNELS,)
- 
+
             # Normalize Q-values before combining
             q_normalized = []
             for i in range(N_CHANNELS):
@@ -949,26 +956,26 @@ class SCHRAAgent:
                     [self.q_normalizers[i].normalize(v) for v in q_np]
                 ).to(DEVICE)
                 q_normalized.append(q_norm)
- 
+
             # Composite Q-value: Q_final = Σ ω_i · Q_i_normalized
             q_final = torch.zeros(self.n_actions, device=DEVICE)
             for i in range(N_CHANNELS):
                 q_final += omega[i] * q_normalized[i]
- 
+
             # Mask illegal actions
             mask = torch.full((self.n_actions,), float("-inf"), device=DEVICE)
             mask[valid_actions] = 0.0
             q_final = q_final + mask
- 
+
         # Store in episode buffer (unnormalized Q of chosen action, detached)
         # We store after action selection so we know which action was taken
- 
+
         # Epsilon-greedy
         if random.random() < self._epsilon():
             action = random.choice(valid_actions)
         else:
             action = q_final.argmax().item()
- 
+
         # Store the NORMALIZED per-channel Q for the chosen action in the
         # episode buffer. Action selection uses q_normalized (above) to
         # form Q_final = Σ ω_i · Q̃_i, so the meta-net regression target
@@ -983,9 +990,9 @@ class SCHRAAgent:
             torch.FloatTensor(state),  # (FEATURE_DIM,)
             q_at_action,               # (N_CHANNELS,) — normalized, detached
         ))
- 
+
         return action
- 
+
     def store_transition(self, state, action, rewards, next_state, done,
                          action_mask, next_action_mask, env_idx=0):
         """Add a 1-step env transition. Internally routed through the
@@ -1071,17 +1078,17 @@ class SCHRAAgent:
                     p_t.data.mul_(1.0 - tau).add_(p.data, alpha=tau)
 
         return losses
- 
+
     def train_meta(self, r_terminal):
         """Retrospective bandit update for the meta-weighting network.
- 
+
         At episode end, for each visited state t:
             G_t = γ^(T-1-t) · r_terminal
             Q_stored = [Q_0(s_t,a_t), Q_1(s_t,a_t), Q_2(s_t,a_t)]  (constants)
             ω = meta_net(s_t)
             Q_pred = Σ ω_i · Q_stored_i
             loss = (G_t - Q_pred)²
- 
+
         Gradients flow through ω only. Q_stored are detached constants.
         """
         if len(self.episode_buffer) == 0:
@@ -1089,29 +1096,29 @@ class SCHRAAgent:
         if self.total_steps < self.warmup_steps:
             self.episode_buffer.clear()
             return 0.0
- 
+
         T = len(self.episode_buffer)
         states = torch.stack([s for s, _ in self.episode_buffer]).to(DEVICE)    # (T, FEATURE_DIM)
         q_stored = torch.stack([q for _, q in self.episode_buffer]).to(DEVICE)  # (T, N_CHANNELS)
- 
+
         # G_t = γ^(T-1-t) · r_terminal
         exponents = torch.arange(T - 1, -1, -1, dtype=torch.float32, device=DEVICE)
         G = (self.gamma ** exponents) * r_terminal  # (T,)
- 
+
         # Meta-network forward
         omega = self.meta_net(states)          # (T, N_CHANNELS)
         q_pred = (omega * q_stored).sum(dim=1) # (T,)
- 
+
         loss = F.mse_loss(q_pred, G)
- 
+
         self.meta_optimizer.zero_grad()
         loss.backward()
         nn.utils.clip_grad_norm_(self.meta_net.parameters(), 5.0)
         self.meta_optimizer.step()
- 
+
         self.episode_buffer.clear()
         return loss.item()
- 
+
     def get_omega(self, state):
         """Get current meta-weights for a state (for logging/visualization).
 
@@ -1172,25 +1179,16 @@ class SCHRAAgent:
         states_np = np.asarray(states, dtype=np.float32)
         n_envs = states_np.shape[0]
         states_t = torch.from_numpy(states_np).to(DEVICE)
+        mask_t = torch.from_numpy(masks_array).to(DEVICE)
 
         with torch.no_grad():
             # Stack per-channel Q-values: (N_CHANNELS, n_envs, n_actions)
             q_stack = torch.stack(
                 [self.critics[c](states_t) for c in range(N_CHANNELS)], dim=0
             )
-            q_stack_np = q_stack.cpu().numpy()
 
-            # Update normalizers with valid Q-values from each env (per channel).
-            for c in range(N_CHANNELS):
-                pieces = []
-                for env_idx in range(n_envs):
-                    va = valid_actions_list[env_idx]
-                    if va:
-                        pieces.append(q_stack_np[c, env_idx, va])
-                if pieces:
-                    self.q_normalizers[c].update(np.concatenate(pieces))
-
-            # Normalize per channel using the just-updated stats.
+            # Normalize per channel. Build mean/std on the same device as
+            # q_stack and apply in-place to avoid a second tensor.
             means = torch.tensor(
                 [n.mean for n in self.q_normalizers], dtype=torch.float32, device=DEVICE
             ).view(N_CHANNELS, 1, 1)
@@ -1203,34 +1201,45 @@ class SCHRAAgent:
             # Meta-weights per env: (n_envs, N_CHANNELS).
             omega_raw = self.meta_net(states_t)
 
-            # Accumulate ω stats over (env, step) samples so TB logs the
-            # distributional mean/std/min/max over the dump window rather
-            # than a single-state snapshot. ~free (one cpu copy per iter).
-            omega_np = omega_raw.detach().cpu().numpy()  # (n_envs, N_CHANNELS)
-            self._omega_sum += omega_np.sum(axis=0)
-            self._omega_sumsq += np.square(omega_np).sum(axis=0)
-            self._omega_min = np.minimum(self._omega_min, omega_np.min(axis=0))
-            self._omega_max = np.maximum(self._omega_max, omega_np.max(axis=0))
-            self._omega_count += omega_np.shape[0]
-
             # Reshape for broadcasted weighted sum: (N_CHANNELS, n_envs, 1)
             omega = omega_raw.T.unsqueeze(-1)
             q_final = (omega * q_norm).sum(dim=0)  # (n_envs, n_actions)
-
-            # Mask invalid actions.
-            mask_t = torch.from_numpy(masks_array).to(DEVICE)
             q_final = q_final.masked_fill(~mask_t, float("-inf"))
 
-            best_actions = q_final.argmax(dim=1).cpu().numpy()  # (n_envs,)
+            best_actions_t = q_final.argmax(dim=1)  # (n_envs,)
 
-        # Epsilon-greedy per env.
+            # Single fused GPU→CPU sync window. Pulling q_stack_np, q_norm_np,
+            # omega_np, and best_actions together lets PyTorch issue one
+            # device-host transfer rather than four. For tiny tensors the
+            # per-call latency of .cpu() dominates the actual byte transfer.
+            q_stack_np = q_stack.cpu().numpy()
+            q_norm_np = q_norm.cpu().numpy()
+            omega_np = omega_raw.detach().cpu().numpy()
+            best_actions = best_actions_t.cpu().numpy()
+
+        # Update normalizers per channel using mask-indexed q_stack (fully
+        # vectorized — replaces the previous (channel × env) Python loop).
+        for c in range(N_CHANNELS):
+            valid_q = q_stack_np[c][masks_array]
+            if valid_q.size:
+                self.q_normalizers[c].update(valid_q)
+
+        # Accumulate ω stats over (env, step) samples so TB logs the
+        # distributional mean/std/min/max over the dump window rather
+        # than a single-state snapshot.
+        self._omega_sum += omega_np.sum(axis=0)
+        self._omega_sumsq += np.square(omega_np).sum(axis=0)
+        self._omega_min = np.minimum(self._omega_min, omega_np.min(axis=0))
+        self._omega_max = np.maximum(self._omega_max, omega_np.max(axis=0))
+        self._omega_count += omega_np.shape[0]
+
+        # Epsilon-greedy per env. Random.random / random.choice in Python is
+        # faster than batched np.random calls at this n_envs scale.
         eps = self._epsilon()
-        actions = np.empty(n_envs, dtype=np.int64)
+        actions = best_actions.astype(np.int64, copy=True)
         for env_idx in range(n_envs):
             if random.random() < eps and valid_actions_list[env_idx]:
                 actions[env_idx] = random.choice(valid_actions_list[env_idx])
-            else:
-                actions[env_idx] = best_actions[env_idx]
 
         # Store the NORMALIZED per-channel Q (NOT raw q_stack_np) for each
         # env's chosen action. Action selection above mixes Q values via
@@ -1238,15 +1247,15 @@ class SCHRAAgent:
         # the same q̃ representation — otherwise ω is learned in raw-Q
         # space and applied in normalized-Q space, silently distorting
         # the channel weights by each channel's std.
-        q_norm_np = q_norm.cpu().numpy()  # (N_CHANNELS, n_envs, n_actions)
+        #
+        # Store numpy arrays (not torch tensors). train_meta_for_env stacks
+        # them once via np.stack + torch.from_numpy, which is faster than
+        # n_envs separate torch.from_numpy(...copy()) calls per step.
         env_range = np.arange(n_envs)
-        q_at_actions = q_norm_np[:, env_range, actions]  # (N_CHANNELS, n_envs)
+        q_at_actions = q_norm_np[:, env_range, actions].T  # (n_envs, N_CHANNELS)
         for env_idx in range(n_envs):
             buf = self.episode_buffers.setdefault(env_idx, [])
-            buf.append((
-                torch.from_numpy(states_np[env_idx].copy()),
-                torch.from_numpy(q_at_actions[:, env_idx].copy()),
-            ))
+            buf.append((states_np[env_idx], q_at_actions[env_idx]))
 
         return actions
 
@@ -1260,8 +1269,13 @@ class SCHRAAgent:
             return None
 
         T = len(buf)
-        states = torch.stack([s for s, _ in buf]).to(DEVICE)
-        q_stored = torch.stack([q for _, q in buf]).to(DEVICE)
+        # buf entries are (np.ndarray state, np.ndarray q_at_action). Stacking
+        # once via numpy + a single torch.from_numpy is faster than building
+        # T separate tensors and torch.stack-ing them.
+        states_np = np.stack([s for s, _ in buf])
+        q_stored_np = np.stack([q for _, q in buf])
+        states = torch.from_numpy(states_np).to(DEVICE)
+        q_stored = torch.from_numpy(q_stored_np).to(DEVICE)
 
         exponents = torch.arange(T - 1, -1, -1, dtype=torch.float32, device=DEVICE)
         G = (self.gamma ** exponents) * r_terminal
@@ -1277,7 +1291,7 @@ class SCHRAAgent:
 
         buf.clear()
         return loss.item()
- 
+
     def save(self, path):
         os.makedirs(path, exist_ok=True)
         for i in range(N_CHANNELS):
@@ -1285,7 +1299,7 @@ class SCHRAAgent:
             torch.save(self.target_critics[i].state_dict(), os.path.join(path, f"target_critic_{i}.pt"))
         torch.save(self.meta_net.state_dict(), os.path.join(path, "meta_net.pt"))
         print(f"SC-HRA model saved to {path}")
- 
+
     def load(self, path):
         for i in range(N_CHANNELS):
             self.critics[i].load_state_dict(
@@ -1407,8 +1421,8 @@ class SCHRAAgent:
             f"(total_steps={self.total_steps}, buffer={len(self.replay_buffer)})"
         )
         return extra
- 
- 
+
+
 # ================================================================
 # ENVIRONMENT FACTORY
 # ================================================================
@@ -1522,13 +1536,17 @@ class _LeagueEnvFn:
         # registered as an *import side-effect* of catanatron.gym, so we have
         # to re-trigger it here or gymnasium.make() raises NamespaceNotFound.
         import catanatron.gym  # noqa: F401
+        # Worker processes also need single-threaded torch. The OMP/MKL env
+        # vars (set on the image) handle BLAS, but torch's intra-op pool is
+        # independently controlled and defaults to physical-core count.
+        torch.set_num_threads(1)
         return make_league_env(self._stage_val)
- 
- 
+
+
 # ================================================================
 # TRAINING LOOP
 # ================================================================
- 
+
 def train(
     total_timesteps=1_000_000,
     save_path=MODEL_DIR,
@@ -1559,7 +1577,7 @@ def train(
     env = make_env(enemy)
     eval_env = make_env(enemy)
     n_actions = env.action_space.n
- 
+
     agent = SCHRAAgent(
         n_actions=n_actions,
         lr_critic=lr_critic,
@@ -1574,14 +1592,14 @@ def train(
         epsilon_end=epsilon_end,
         epsilon_decay_steps=epsilon_decay_steps,
     )
- 
+
     writer = SummaryWriter(log_dir)
- 
+
     # Rolling stats
     recent_wins = deque(maxlen=100)
     recent_ep_rewards = deque(maxlen=100)
     recent_ep_lengths = deque(maxlen=100)
- 
+
     obs, info = env.reset()
     episode_reward = 0.0
     episode_channel_rewards = np.zeros(N_CHANNELS)
@@ -1643,44 +1661,44 @@ def train(
         valid_actions = env.get_valid_actions()
         if not valid_actions:
             valid_actions = [0]
- 
+
         # Build action mask
         action_mask = np.zeros(n_actions, dtype=bool)
         action_mask[valid_actions] = True
- 
+
         # Select action
         action = agent.select_action(obs, valid_actions)
- 
+
         # Step
         next_obs, _, terminated, truncated, info = env.step(action)
         done = terminated or truncated
         rewards = info["rewards"]  # (N_CHANNELS,)
- 
+
         # Next action mask
         next_valid = env.get_valid_actions()
         if not next_valid:
             next_valid = [0]
         next_action_mask = np.zeros(n_actions, dtype=bool)
         next_action_mask[next_valid] = True
- 
+
         # Store transition
         agent.store_transition(
             obs, action, rewards, next_obs, done,
             action_mask, next_action_mask,
         )
- 
+
         # Track episode stats
         episode_channel_rewards += rewards
         episode_steps += 1
- 
+
         # Train critics
         critic_losses = agent.train_critics()
- 
+
         if done:
             # Train meta-network
             r_terminal = info["r_terminal"]
             meta_loss = agent.train_meta(r_terminal)
- 
+
             # Track stats
             won = info.get("win", 0)
             recent_wins.append(won)
@@ -1688,7 +1706,7 @@ def train(
             recent_ep_rewards.append(ep_total)
             recent_ep_lengths.append(episode_steps)
             episode_count += 1
- 
+
             # Log to TensorBoard
             if episode_count % 10 == 0 and len(recent_wins) >= 10:
                 win_rate = np.mean(recent_wins)
@@ -1701,17 +1719,17 @@ def train(
                 writer.add_scalar("channel/terminal", r_terminal, step)
                 writer.add_scalar("train/epsilon", agent._epsilon(), step)
                 writer.add_scalar("train/meta_loss", meta_loss, step)
- 
+
                 # Log meta-weights at current state (early/mid/late proxy)
                 omega = agent.get_omega(obs)
                 writer.add_scalar("omega/resource", omega[0], step)
                 writer.add_scalar("omega/position", omega[1], step)
                 writer.add_scalar("omega/vp", omega[2], step)
- 
+
                 if critic_losses:
                     for name, val in critic_losses.items():
                         writer.add_scalar(f"train/{name}_loss", val, step)
- 
+
             # Print progress
             if episode_count % 50 == 0:
                 wr = np.mean(recent_wins) if recent_wins else 0
@@ -1723,16 +1741,17 @@ def train(
                     f"WR {wr:.1%} | R {avg_r:>7.1f} | L {avg_l:>5.0f} | "
                     f"ε {eps:.3f}"
                 )
- 
+
             # Periodic evaluation
             if episode_count % (eval_freq // 500 + 1) == 0 and len(recent_wins) >= 20:
                 win_rate = np.mean(recent_wins)
                 if win_rate > best_win_rate:
                     best_win_rate = win_rate
                     agent.save_checkpoint(
-                        os.path.join(save_path, "best"), extra=_trainer_extra()
+                        os.path.join(save_path, f"best_step_{step}"),
+                        extra=_trainer_extra(),
                     )
- 
+
             # Reset
             obs, info = env.reset()
             episode_channel_rewards = np.zeros(N_CHANNELS)
@@ -1743,18 +1762,19 @@ def train(
         # Periodic full-state checkpoint (weights + optimizers + buffer + RNG)
         if checkpoint_freq > 0 and (step + 1) % checkpoint_freq == 0:
             agent.save_checkpoint(
-                os.path.join(save_path, "checkpoint"), extra=_trainer_extra()
+                os.path.join(save_path, f"checkpoint_step_{step + 1}"),
+                extra=_trainer_extra(),
             )
 
     # Save final model + final full checkpoint
-    agent.save(os.path.join(save_path, "final"))
-    agent.save_checkpoint(
-        os.path.join(save_path, "checkpoint"), extra=_trainer_extra()
-    )
+    final_model_dir = os.path.join(save_path, f"final_step_{total_timesteps}")
+    final_ckpt_dir = os.path.join(save_path, f"checkpoint_step_{total_timesteps}")
+    agent.save(final_model_dir)
+    agent.save_checkpoint(final_ckpt_dir, extra=_trainer_extra())
     writer.close()
     env.close()
     eval_env.close()
-    print(f"Training complete. Final model at {save_path}/final")
+    print(f"Training complete. Final model at {final_model_dir}")
     return agent
 
 
@@ -1793,7 +1813,7 @@ def league_train(
     checkpoint_freq=1_000_000,
     start_stage=0,
     device="cpu",
-    n_envs=4,
+    n_envs=15,
 ):
     """Opponent-sampling / league training for SC-HRA. Mirrors 185_ppo.league_train:
     starts vs WeightedRandom and shifts the opponent distribution toward
@@ -1936,35 +1956,62 @@ def league_train(
         lr_c, lr_m = lr_critic_start, lr_meta_start
         start_time = time.time()
 
-        try:
-            from tqdm.rich import tqdm as _tqdm
-        except ImportError:
-            from tqdm import tqdm as _tqdm
-        pbar = _tqdm(total=total_timesteps, initial=start_step)
+        # Plain tqdm, not tqdm.rich: the rich variant uses a Live render
+        # loop that needs a TTY and emits nothing under Modal's non-TTY log
+        # pipe until the run ends. Plain tqdm writes carriage-return updates
+        # that Modal renders fine. mininterval throttles to one line every
+        # few seconds so logs stay readable; PYTHONUNBUFFERED=1 on the Modal
+        # image makes those lines flush in real time.
+        import sys
+        from tqdm import tqdm as _tqdm
+        pbar = _tqdm(
+            total=total_timesteps,
+            initial=start_step,
+            file=sys.stdout,
+            mininterval=5.0,
+            ascii=True,
+        )
 
         # SB3 SubprocVecEnv.reset() returns just the (n_envs, FEATURE_DIM) obs.
         obs = vec_env.reset()
         episode_channel_rewards = [np.zeros(N_CHANNELS) for _ in range(n_envs)]
         episode_steps = [0] * n_envs
 
+        # Seed the very first iteration's valid_actions via a one-shot
+        # env_method. After this, valid_actions ride along in info["valid_actions"]
+        # on every step, and we only fall back to env_method for envs that
+        # just hit done (the auto-reset happens inside the worker, after our
+        # wrapper's step() has already returned).
+        valid_actions_list = vec_env.env_method("get_valid_actions")
+        valid_actions_list = [va if va else [0] for va in valid_actions_list]
+        masks = np.zeros((n_envs, n_actions), dtype=bool)
+        for i, va in enumerate(valid_actions_list):
+            masks[i, va] = True
+
         step = start_step
         while step < total_timesteps:
-            valid_actions_list = vec_env.env_method("get_valid_actions")
-            valid_actions_list = [
-                va if va else [0] for va in valid_actions_list
-            ]
-            masks = np.zeros((n_envs, n_actions), dtype=bool)
-            for i, va in enumerate(valid_actions_list):
-                masks[i, va] = True
-
             actions = agent.select_actions_batch(obs, valid_actions_list, masks)
 
             new_obs, _, dones, infos = vec_env.step(actions)
 
-            next_valid_list = vec_env.env_method("get_valid_actions")
-            next_valid_list = [
-                va if va else [0] for va in next_valid_list
-            ]
+            # Pull next-step valid_actions out of info (set by SCHRAWrapper.step).
+            # For done envs, the info is from the terminal step but SubprocVecEnv
+            # has already auto-reset to a fresh episode, so we need post-reset
+            # valid_actions — fetch only for those indices.
+            next_valid_list: list = [None] * n_envs
+            done_indices: list = []
+            for i in range(n_envs):
+                if dones[i]:
+                    done_indices.append(i)
+                else:
+                    va = infos[i].get("valid_actions")
+                    next_valid_list[i] = va if va else [0]
+            if done_indices:
+                fresh = vec_env.env_method(
+                    "get_valid_actions", indices=done_indices
+                )
+                for j, i in enumerate(done_indices):
+                    next_valid_list[i] = fresh[j] if fresh[j] else [0]
             next_masks = np.zeros((n_envs, n_actions), dtype=bool)
             for i, va in enumerate(next_valid_list):
                 next_masks[i, va] = True
@@ -2030,6 +2077,8 @@ def league_train(
                     episode_steps[i] = 0
 
             obs = new_obs
+            valid_actions_list = next_valid_list
+            masks = next_masks
 
             lr_c, lr_m = _apply_anneal(step)
 
@@ -2101,27 +2150,29 @@ def league_train(
             # n_envs each iter so we can't use modulo; track when we last saved.
             if checkpoint_freq > 0 and step - last_checkpoint_step >= checkpoint_freq:
                 agent.save_checkpoint(
-                    os.path.join(save_path, "checkpoint_league"), extra=_trainer_extra()
+                    os.path.join(save_path, f"checkpoint_league_step_{step}"),
+                    extra=_trainer_extra(),
                 )
                 if len(recent_wins) >= 20:
                     win_rate = float(np.mean(recent_wins))
                     if win_rate > best_win_rate:
                         best_win_rate = win_rate
                         agent.save_checkpoint(
-                            os.path.join(save_path, "best_league"), extra=_trainer_extra()
+                            os.path.join(save_path, f"best_league_step_{step}"),
+                            extra=_trainer_extra(),
                         )
                 last_checkpoint_step = step
 
         pbar.refresh()
         pbar.close()
-        agent.save(os.path.join(save_path, "league_final"))
-        agent.save_checkpoint(
-            os.path.join(save_path, "checkpoint_league"), extra=_trainer_extra()
-        )
+        final_model_dir = os.path.join(save_path, f"league_final_step_{step}")
+        final_ckpt_dir = os.path.join(save_path, f"checkpoint_league_step_{step}")
+        agent.save(final_model_dir)
+        agent.save_checkpoint(final_ckpt_dir, extra=_trainer_extra())
         sb3_logger.close()
         vec_env.close()
         eval_env.close()
-        print(f"Model saved to {save_path}/league_final")
+        print(f"Model saved to {final_model_dir}")
         print(f"TensorBoard logs at {log_dir} — run: tensorboard --logdir {log_dir}")
         return agent
 
@@ -2129,33 +2180,33 @@ def league_train(
 # ================================================================
 # EVALUATION
 # ================================================================
- 
+
 def evaluate(agent_or_path, n_games=100, enemy=None, verbose=True):
     """Evaluate an SC-HRA agent against an opponent."""
     env = make_env(enemy)
     n_actions = env.action_space.n
- 
+
     if isinstance(agent_or_path, str):
         agent = SCHRAAgent(n_actions)
         agent.load(agent_or_path)
     else:
         agent = agent_or_path
- 
+
     # Set epsilon to 0 for deterministic evaluation
     saved_epsilon_end = agent.epsilon_end
     agent.epsilon_end = 0.0
     agent.epsilon_start = 0.0
- 
+
     wins = 0
     total_vp_margin = 0
     omega_early = []
     omega_late = []
- 
+
     for game_idx in range(n_games):
         obs, info = env.reset()
         done = False
         game_steps = 0
- 
+
         while not done:
             valid_actions = env.get_valid_actions()
             if not valid_actions:
@@ -2164,49 +2215,49 @@ def evaluate(agent_or_path, n_games=100, enemy=None, verbose=True):
             obs, _, terminated, truncated, info = env.step(action)
             done = terminated or truncated
             game_steps += 1
- 
+
         # Record omega at different phases
         agent.episode_buffer.clear()
- 
+
         state = env.env.unwrapped.game.state
         my_vps = get_victory_points(state, Color.BLUE)
         opp_vps = max(
             (get_victory_points(state, c) for c in state.colors if c != Color.BLUE),
             default=0,
         )
- 
+
         if env.env.unwrapped.game.winning_color() == Color.BLUE:
             wins += 1
         total_vp_margin += my_vps - opp_vps
- 
+
         if verbose and (game_idx + 1) % 10 == 0:
             print(
                 f"Game {game_idx+1}/{n_games} | "
                 f"WR {wins/(game_idx+1):.1%} | "
                 f"VP margin {total_vp_margin/(game_idx+1):+.1f}"
             )
- 
+
     # Restore epsilon
     agent.epsilon_end = saved_epsilon_end
- 
+
     if verbose:
         print("\n" + "=" * 60)
         print(f"RESULTS ({n_games} games)")
         print(f"Win rate: {wins/n_games:.1%}")
         print(f"Avg VP margin: {total_vp_margin/n_games:+.1f}")
         print("=" * 60)
- 
+
     env.close()
     return wins / n_games
- 
- 
+
+
 # ================================================================
 # CATANATRON PLAYER CLASS
 # ================================================================
- 
+
 class SCHRAPlayer(Player):
     """Catanatron Player that uses a trained SC-HRA agent."""
- 
+
     def __init__(self, color, model_path=None):
         super().__init__(color)
         self._env = gymnasium.make("catanatron/Catanatron-v0")
@@ -2218,35 +2269,35 @@ class SCHRAPlayer(Player):
         # No exploration at play time
         self.agent.epsilon_start = 0.0
         self.agent.epsilon_end = 0.0
- 
+
     def decide(self, game, playable_actions):
         if len(playable_actions) == 1:
             return playable_actions[0]
- 
+
         state = game.state
         if self.opp_color is None:
             self.opp_color = next(c for c in state.colors if c != self.color)
- 
+
         obs = compute_features(state, self.color, self.opp_color)
- 
+
         self._env.reset()
         self._env.unwrapped.game = game
         valid_actions = self._env.unwrapped.get_valid_actions()
         if not valid_actions:
             return playable_actions[0]
- 
+
         action = self.agent.select_action(obs, valid_actions)
         self.agent.episode_buffer.clear()  # don't accumulate across games
         return self._env.unwrapped.actions[action]
- 
- 
+
+
 # ================================================================
 # MAIN
 # ================================================================
- 
+
 if __name__ == "__main__":
     import argparse
- 
+
     parser = argparse.ArgumentParser(description="SC-HRA for 1v1 Catan")
     parser.add_argument("--mode", choices=["train", "eval"], default="train")
     parser.add_argument("--timesteps", type=int, default=1_000_000)
@@ -2269,7 +2320,7 @@ if __name__ == "__main__":
              "resume training from with no dropoff.",
     )
     parser.add_argument(
-        "--checkpoint-freq", type=int, default=1_000_000,
+        "--checkpoint-freq", type=int, default=25_000_000,
         help="Save a full training checkpoint every N env steps (0 to disable).",
     )
     parser.add_argument(
