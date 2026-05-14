@@ -7,6 +7,10 @@ Usage:
     python simulate_ppo.py --model medium               # medium model
     python simulate_ppo.py --model best_league          # best league checkpoint
     python simulate_ppo.py --model best_medium          # best medium checkpoint
+    python simulate_ppo.py --model schra                # SC-HRA latest checkpoint
+    python simulate_ppo.py --model best_schra           # SC-HRA best-eval checkpoint
+    python simulate_ppo.py --model schra_nsteps1        # Modal-trained SC-HRA (nsteps1 best_league_step_29000145)
+    python simulate_ppo.py --schra-path PATH            # any SC-HRA checkpoint directory
     python simulate_ppo.py --opponent value             # vs ValueFunctionPlayer
     python simulate_ppo.py --games 3                    # play 3 games (default 1)
     python simulate_ppo.py --depth 1                    # AlphaBeta depth (default 2)
@@ -15,6 +19,8 @@ Usage:
 """
 
 import argparse
+import csv
+import datetime
 import os
 import sys
 
@@ -40,12 +46,27 @@ from catanatron.players.weighted_random import WeightedRandomPlayer
 from catanatron.web.models import GameState, database_session
 from catanatron.web.utils import ensure_link, open_link
 import importlib as _il
+import importlib.util as _ilu
 _ppo_mod = _il.import_module("catanatron_experimental.machine_learning.players.185_ppo")
 compute_features = _ppo_mod.compute_features
 from catanatron_experimental.machine_learning.players.initial_placement_ppo import (
     encode_board_state as compute_init_placement_features,
     OBS_DIM as INIT_PLACEMENT_OBS_DIM,
 )
+
+
+def _import_schra():
+    """Import sc-hra.py despite the hyphen in its filename."""
+    path = os.path.join(
+        ROOT, "catanatron_experimental", "catanatron_experimental",
+        "machine_learning", "players", "sc-hra.py",
+    )
+    spec = _ilu.spec_from_file_location("schra", path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Could not load sc-hra module from {path}")
+    schra = _ilu.module_from_spec(spec)
+    spec.loader.exec_module(schra)
+    return schra
 
 # ---------------------------------------------------------------------------
 # Paths to trained artefacts
@@ -69,14 +90,35 @@ INIT_PLACE_DIR   = os.path.join(
 INIT_PLACE_FINAL = os.path.join(INIT_PLACE_DIR, "final_model.zip")
 INIT_PLACE_BEST  = os.path.join(INIT_PLACE_DIR, "best", "best_model.zip")
 
+# SC-HRA (sc-hra.py) checkpoint directories — each is a folder containing
+# critic_*.pt, target_critic_*.pt, meta_net.pt and optionally checkpoint.pt.
+SCHRA_MODEL_DIR  = os.path.join(
+    ROOT, "catanatron_experimental", "catanatron_experimental",
+    "machine_learning", "players", "schra_model",
+)
+SCHRA_BEST       = os.path.join(SCHRA_MODEL_DIR, "best")
+SCHRA_CHECKPOINT = os.path.join(SCHRA_MODEL_DIR, "checkpoint")
+
+# Modal-trained SC-HRA checkpoints downloaded to the user's local machine.
+SCHRA_NSTEPS1 = os.path.join(
+    os.path.expanduser("~"),
+    "modal_downloads", "schra-data", "models", "nsteps1",
+    "best_league_step_29000145",
+)
+
 MODEL_REGISTRY = {
-    "league":      (LEAGUE_MODEL, LEAGUE_NORM),
-    "best_league": (BEST_LEAGUE,  LEAGUE_NORM),
-    "medium":      (MEDIUM_MODEL, MEDIUM_NORM),
-    "best_medium": (BEST_MEDIUM,  MEDIUM_NORM),
-    "best":        (BEST_MODEL, BEST_NORM),
-    "none":        (None, None),
+    "league":         (LEAGUE_MODEL, LEAGUE_NORM),
+    "best_league":    (BEST_LEAGUE,  LEAGUE_NORM),
+    "medium":         (MEDIUM_MODEL, MEDIUM_NORM),
+    "best_medium":    (BEST_MEDIUM,  MEDIUM_NORM),
+    "best":           (BEST_MODEL, BEST_NORM),
+    "schra":          (SCHRA_CHECKPOINT, None),
+    "best_schra":     (SCHRA_BEST, None),
+    "schra_nsteps1":  (SCHRA_NSTEPS1, None),
+    "none":           (None, None),
 }
+
+SCHRA_MODELS = {"schra", "best_schra", "schra_nsteps1"}
 
 # ---------------------------------------------------------------------------
 # PPOPlayer  — wraps a MaskablePPO checkpoint as a catanatron Player
@@ -170,6 +212,141 @@ class PPOPlayer(Player):
             deterministic=True,
         )
         return from_action_space(int(action_int[0]), self.color, PLAYER_COLORS, MAP_TYPE)
+
+
+class SCHRAModelPlayer(Player):
+    """Wraps a trained SC-HRA agent (3 DQN critics + meta-weighting net) as a
+    catanatron Player. SC-HRA uses 25-dim hand-crafted features and chooses
+    actions by combining per-channel Q-values via state-conditioned weights."""
+
+    # Names for SC-HRA's 3 reward channels, matching sc-hra.py SCHRAWrapper.
+    CHANNEL_NAMES = ("resource", "position", "vp")
+
+    def __init__(self, color: Color, model_path: str, name: str = "SCHRA"):
+        super().__init__(color, is_bot=True)
+        self.name = name
+        self._schra = _import_schra()
+        # SC-HRA's critic outputs Q-values indexed against the gym env's
+        # action enumeration; we need a live env to map indices back to
+        # catanatron actions in decide().
+        import gymnasium
+        self._env = gymnasium.make("catanatron/Catanatron-v0")
+        n_actions = self._env.action_space.n
+        self.agent = self._schra.SCHRAAgent(n_actions)
+        self.agent.load(model_path)
+        # Restore Q-value normalizer stats from the full checkpoint if it
+        # exists, so inference uses the training-time normalization rather
+        # than rebuilding stats from a fresh (mean=0, var=1) baseline.
+        ckpt_pt = os.path.join(model_path, "checkpoint.pt")
+        if os.path.exists(ckpt_pt):
+            import torch
+            ckpt = torch.load(ckpt_pt, map_location="cpu", weights_only=False)
+            for i, n in enumerate(ckpt.get("q_normalizers", [])):
+                self.agent.q_normalizers[i].mean = n["mean"]
+                self.agent.q_normalizers[i].var = n["var"]
+                self.agent.q_normalizers[i].count = n["count"]
+        # No exploration at play time.
+        self.agent.epsilon_start = 0.0
+        self.agent.epsilon_end = 0.0
+        self.opp_color = None
+        # Per-decision omega + chosen-action Q trace for the current game.
+        # Reset between games via reset_omega_log(); flushed to disk via
+        # dump_omega_log().
+        self.omega_log = []
+        self.omega_log_dir = os.path.join(ROOT, "schra_omega_logs")
+        print(f"[SCHRAModelPlayer] Loaded SC-HRA model from {model_path} "
+              f"(n_actions={n_actions})")
+
+    def reset_omega_log(self):
+        self.omega_log = []
+
+    def dump_omega_log(self, tag: str = "") -> str | None:
+        if not self.omega_log:
+            return None
+        os.makedirs(self.omega_log_dir, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        fname = f"omega_{ts}{('_' + tag) if tag else ''}.csv"
+        path = os.path.join(self.omega_log_dir, fname)
+        cols = self.omega_log[0].keys()
+        with open(path, "w", newline="") as f:
+            w = csv.DictWriter(f, fieldnames=cols)
+            w.writeheader()
+            w.writerows(self.omega_log)
+        # Summary: mean omega per channel across all decisions in the game.
+        omegas = np.array([
+            [row[f"omega_{c}"] for c in self.CHANNEL_NAMES]
+            for row in self.omega_log
+        ])
+        means = omegas.mean(axis=0)
+        first = omegas[0]
+        last  = omegas[-1]
+        print(f"  Omega log:  {path}  ({len(self.omega_log)} decisions)")
+        print(f"    mean   ω: " + ", ".join(
+            f"{c}={m:.3f}" for c, m in zip(self.CHANNEL_NAMES, means)))
+        print(f"    first  ω: " + ", ".join(
+            f"{c}={v:.3f}" for c, v in zip(self.CHANNEL_NAMES, first)))
+        print(f"    last   ω: " + ", ".join(
+            f"{c}={v:.3f}" for c, v in zip(self.CHANNEL_NAMES, last)))
+        return path
+
+    def __reduce__(self):
+        # Same trick as PPOPlayer — the Flask server unpickles game states
+        # but doesn't know about SCHRAModelPlayer.
+        return (Player, (self.color, True))
+
+    def decide(self, game: Game, playable_actions):
+        if len(playable_actions) == 1:
+            return playable_actions[0]
+
+        state = game.state
+        if self.opp_color is None:
+            self.opp_color = next(c for c in state.colors if c != self.color)
+
+        obs = self._schra.compute_features(state, self.color, self.opp_color)
+
+        self._env.reset()
+        self._env.unwrapped.game = game
+        valid_actions = self._env.unwrapped.get_valid_actions()
+        if not valid_actions:
+            return playable_actions[0]
+
+        action_idx = self.agent.select_action(obs, valid_actions)
+
+        # Capture this turn's meta-weights ω and the per-channel normalized
+        # Q for the chosen action. select_action already pushed (state,
+        # q_at_action) to episode_buffer — we grab it before clearing.
+        import torch
+        with torch.no_grad():
+            state_t = torch.FloatTensor(obs).unsqueeze(0).to(self._schra.DEVICE)
+            omega = self.agent.meta_net(state_t).squeeze(0).cpu().numpy()
+        q_at_action = None
+        if self.agent.episode_buffer:
+            q_at_action = self.agent.episode_buffer[-1][1].cpu().numpy()
+        # Now safe to clear the meta-net training buffer.
+        self.agent.episode_buffer.clear()
+
+        my_vps = self._schra.get_victory_points(state, self.color)
+        opp_vps = self._schra.get_victory_points(state, self.opp_color)
+        row: dict[str, float] = {
+            "turn": int(state.num_turns),
+            "decision_idx": len(self.omega_log),
+            "my_vps": int(my_vps),
+            "opp_vps": int(opp_vps),
+            "action_idx": int(action_idx),
+        }
+        for i, ch in enumerate(self.CHANNEL_NAMES):
+            row[f"omega_{ch}"] = float(omega[i])
+            row[f"q_{ch}"] = float(q_at_action[i]) if q_at_action is not None else float("nan")
+        self.omega_log.append(row)
+
+        catan_action = from_action_space(action_idx, self.color, PLAYER_COLORS, MAP_TYPE)
+        if catan_action in playable_actions:
+            return catan_action
+        # Fallback: map the gym index back to a playable_action by index match.
+        for a in playable_actions:
+            if to_action_space(a, PLAYER_COLORS, MAP_TYPE) == action_idx:
+                return a
+        return playable_actions[0]
 
 
 class InitPlacementPPOPlayer(Player):
@@ -335,6 +512,13 @@ def main():
         default=2,
         help="Depth for the AlphaBeta initial-placement player (default: 2).",
     )
+    parser.add_argument(
+        "--schra-path",
+        default=None,
+        help="Override the SC-HRA model directory (must contain critic_*.pt, "
+             "target_critic_*.pt, meta_net.pt; checkpoint.pt optional). When "
+             "set, --model is forced to a SC-HRA loader regardless of its value.",
+    )
     args = parser.parse_args()
 
     if args.init_placement and args.alphabeta_init:
@@ -343,12 +527,34 @@ def main():
 
     model_path, _ = MODEL_REGISTRY[args.model]
 
-    if args.model == "none":
+    if args.schra_path is not None:
+        schra_path = os.path.abspath(os.path.expanduser(args.schra_path))
+        if not os.path.isdir(schra_path):
+            print(f"ERROR: SC-HRA model directory not found: {schra_path}")
+            sys.exit(1)
+        schra_label = os.path.basename(schra_path.rstrip(os.sep)) or "schra"
+        main_player = SCHRAModelPlayer(
+            color=Color.BLUE,
+            model_path=schra_path,
+            name=f"SCHRA-{schra_label}",
+        )
+        main_label = f"SCHRA-{schra_label}"
+    elif args.model == "none":
         if not (args.init_placement or args.alphabeta_init):
             print("ERROR: --model none only makes sense with --init-placement or --alphabeta-init")
             sys.exit(1)
         main_player = WeightedRandomPlayer(Color.BLUE)
         main_label = "WeightedRandom"
+    elif args.model in SCHRA_MODELS:
+        if not os.path.isdir(model_path):
+            print(f"ERROR: SC-HRA model directory not found: {model_path}")
+            sys.exit(1)
+        main_player = SCHRAModelPlayer(
+            color=Color.BLUE,
+            model_path=model_path,
+            name=f"SCHRA-{args.model}",
+        )
+        main_label = f"SCHRA-{args.model}"
     else:
         if not os.path.exists(model_path):
             print(f"ERROR: model file not found: {model_path}")
@@ -391,10 +597,15 @@ def main():
     urls = []
     last_game = None
     for i in range(1, args.games + 1):
+        if isinstance(main_player, SCHRAModelPlayer):
+            main_player.reset_omega_log()
         opponent = make_opponent(args.opponent, args.depth)
         winner, url, last_game = play_game(ppo_player, opponent, i)
         results.append(winner)
         urls.append(url)
+        if isinstance(main_player, SCHRAModelPlayer):
+            winner_str = "BLUE" if winner == Color.BLUE else ("RED" if winner == Color.RED else "draw")
+            main_player.dump_omega_log(tag=f"game{i}_{winner_str}")
 
     wins = sum(1 for w in results if w == Color.BLUE)
     print(f"\n=== Summary ({args.games} game(s)) ===")
